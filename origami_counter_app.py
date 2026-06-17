@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import math
 import re
 import traceback
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, TOP, Button, Canvas, Entry, Frame, Label, Listbox, Menu, Scrollbar, StringVar, Tk, filedialog, messagebox, ttk
 
 import joblib
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageOps, ImageTk
 from skimage import color, exposure, filters, measure, morphology, transform
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import Pipeline
@@ -23,6 +25,8 @@ OUTPUT_DIR = "analysis_output"
 LABELS_FILE = "labels.json"
 MODEL_FILE = "origami_state_classifier.joblib"
 COUNTS_FILE = "origami_counts.csv"
+CURRENT_RESULTS_DIR = "classified_images"
+PLOTS_DIR = "plots"
 THUMB_MAX = 980
 MODEL_FORMAT_VERSION = 2
 UNLABELED_COLOR = "#45a3ff"
@@ -312,6 +316,11 @@ class OrigamiCounterApp:
         self.training_status = StringVar(value="")
         self.scale_bar_um = StringVar(value="1.0")
         self.scale_status = StringVar(value="")
+        self.analysis_status = StringVar(value="Load an all_images folder to begin.")
+        self.analysis_rows: list[dict[str, str | float]] = []
+        self.analysis_csv_path: Path | None = None
+        self.plot_previews: dict[str, Image.Image] = {}
+        self.plot_preview_photo: ImageTk.PhotoImage | None = None
         self.min_area_um2: float | None = None
         self.max_area_um2: float | None = None
 
@@ -329,7 +338,14 @@ class OrigamiCounterApp:
         menubar.add_cascade(label="File", menu=file_menu)
         self.root.config(menu=menubar)
 
-        main = Frame(self.root)
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill=BOTH, expand=True)
+        classify_tab = Frame(notebook)
+        analysis_tab = Frame(notebook)
+        notebook.add(classify_tab, text="Classify")
+        notebook.add(analysis_tab, text="Analysis")
+
+        main = Frame(classify_tab)
         main.pack(fill=BOTH, expand=True)
 
         sidebar_container = Frame(main, width=350)
@@ -351,16 +367,29 @@ class OrigamiCounterApp:
         Button(sidebar, text="Open Root", command=self.choose_root).pack(fill="x")
         Button(sidebar, text="Load Classifier", command=self.load_classifier_from_file).pack(fill="x", pady=(4, 0))
         Button(sidebar, text="Export Classifier", command=self.export_classifier).pack(fill="x", pady=(4, 0))
+        Button(sidebar, text="Plot Counts CSV", command=self.plot_counts_csv).pack(fill="x", pady=(4, 0))
         Label(sidebar, text="Images").pack(anchor="w", pady=(10, 2))
-        self.image_list = Listbox(sidebar, height=10, exportselection=False)
-        self.image_list.pack(fill="x")
+        image_list_frame = Frame(sidebar)
+        image_list_frame.pack(fill="x")
+        self.image_list = Listbox(image_list_frame, height=10, exportselection=False)
+        image_scroll = Scrollbar(image_list_frame, orient="vertical", command=self.image_list.yview)
+        self.image_list.configure(yscrollcommand=image_scroll.set)
+        self.image_list.pack(side=LEFT, fill="x", expand=True)
+        image_scroll.pack(side=RIGHT, fill="y")
         self.image_list.bind("<<ListboxSelect>>", self.on_image_select)
+        self.image_list.bind("<MouseWheel>", self.on_image_list_mousewheel)
 
         labels_box = ttk.LabelFrame(sidebar, text="Training Data Images")
         labels_box.pack(fill="x", pady=8)
-        self.label_summary = Listbox(labels_box, height=5, exportselection=False)
-        self.label_summary.pack(fill="x", padx=6, pady=(4, 2))
+        label_list_frame = Frame(labels_box)
+        label_list_frame.pack(fill="x", padx=6, pady=(4, 2))
+        self.label_summary = Listbox(label_list_frame, height=5, exportselection=False)
+        label_scroll = Scrollbar(label_list_frame, orient="vertical", command=self.label_summary.yview)
+        self.label_summary.configure(yscrollcommand=label_scroll.set)
+        self.label_summary.pack(side=LEFT, fill="x", expand=True)
+        label_scroll.pack(side=RIGHT, fill="y")
         self.label_summary.bind("<Double-Button-1>", self.load_selected_labeled_image)
+        self.label_summary.bind("<MouseWheel>", self.on_label_summary_mousewheel)
         row = Frame(labels_box)
         row.pack(fill="x", padx=6, pady=(2, 6))
         Button(row, text="Open", command=self.load_selected_labeled_image).pack(side=LEFT, fill="x", expand=True)
@@ -397,6 +426,8 @@ class OrigamiCounterApp:
         self.training_progress.pack(fill="x", padx=6, pady=(0, 4))
         Label(train_box, textvariable=self.training_status, justify=LEFT).pack(fill="x", padx=6)
         Button(train_box, text="Classify Image", command=self.classify_current).pack(fill="x", padx=6, pady=4)
+        Button(train_box, text="Export Current Results", command=self.export_current_results).pack(fill="x", padx=6, pady=4)
+        Button(train_box, text="Classify + Export All Images", command=self.classify_export_all_images).pack(fill="x", padx=6, pady=4)
         Button(train_box, text="Batch Count", command=self.batch_count).pack(fill="x", padx=6, pady=4)
         Label(train_box, textvariable=self.counts_text, justify=LEFT).pack(fill="x", padx=6, pady=6)
 
@@ -432,11 +463,71 @@ class OrigamiCounterApp:
         self.canvas.bind("<Shift-MouseWheel>", self.on_shift_mousewheel)
         self.canvas.bind("<Configure>", self.on_canvas_configure)
 
+        self.build_analysis_tab(analysis_tab)
+
     def add_labeled_entry(self, parent: Frame, label: str, var: StringVar) -> None:
         row = Frame(parent)
         row.pack(fill="x", padx=6, pady=3)
         Label(row, text=label, width=14, anchor="w").pack(side=LEFT)
         Entry(row, textvariable=var, width=10).pack(side=RIGHT)
+
+    def build_analysis_tab(self, parent: Frame) -> None:
+        toolbar = Frame(parent)
+        toolbar.pack(fill="x", padx=8, pady=8)
+        Button(toolbar, text="Load all_images Folder", command=self.load_analysis_folder).pack(side=LEFT)
+        Button(toolbar, text="Generate Plot Previews", command=self.generate_analysis_plot_previews).pack(side=LEFT, padx=6)
+        Button(toolbar, text="Save Selected Plot", command=self.save_selected_plot_preview).pack(side=LEFT)
+        Button(toolbar, text="Save All Plots", command=self.save_all_plot_previews).pack(side=LEFT, padx=6)
+        Label(toolbar, textvariable=self.analysis_status).pack(side=LEFT, padx=12)
+
+        summary_box = ttk.LabelFrame(parent, text="Summary")
+        summary_box.pack(fill="x", padx=8, pady=(0, 8))
+        self.analysis_summary = Listbox(summary_box, height=6, exportselection=False)
+        self.analysis_summary.pack(fill="x", padx=6, pady=6)
+
+        plot_box = ttk.LabelFrame(parent, text="Plot Preview")
+        plot_box.pack(fill="x", padx=8, pady=(0, 8))
+        plot_inner = Frame(plot_box)
+        plot_inner.pack(fill="x", padx=6, pady=6)
+        self.plot_list = Listbox(plot_inner, height=6, exportselection=False)
+        self.plot_list.pack(side=LEFT, fill="y")
+        self.plot_list.bind("<<ListboxSelect>>", self.on_plot_preview_select)
+        self.plot_preview_label = Label(plot_inner, text="Generate plot previews to view them here.", background="#f0f0f0", width=90, height=18)
+        self.plot_preview_label.pack(side=LEFT, fill="both", expand=True, padx=(8, 0))
+
+        table_frame = Frame(parent)
+        table_frame.pack(fill=BOTH, expand=True, padx=8, pady=(0, 8))
+        columns = ("kind", "origami_label", "image", "total", "primary_fraction", "secondary_fraction", "primary_secondary_ratio")
+        self.analysis_table = ttk.Treeview(table_frame, columns=columns, show="headings")
+        headings = {
+            "kind": "Row",
+            "origami_label": "Origami",
+            "image": "Image",
+            "total": "Total",
+            "primary_fraction": "Frac 1st State",
+            "secondary_fraction": "Frac 2nd State",
+            "primary_secondary_ratio": "1st/2nd Ratio",
+        }
+        widths = {
+            "kind": 90,
+            "origami_label": 90,
+            "image": 260,
+            "total": 80,
+            "primary_fraction": 110,
+            "secondary_fraction": 110,
+            "primary_secondary_ratio": 110,
+        }
+        for col in columns:
+            self.analysis_table.heading(col, text=headings[col])
+            self.analysis_table.column(col, width=widths[col], anchor="w")
+        y_scroll = Scrollbar(table_frame, orient="vertical", command=self.analysis_table.yview)
+        x_scroll = Scrollbar(table_frame, orient="horizontal", command=self.analysis_table.xview)
+        self.analysis_table.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        self.analysis_table.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
 
     def on_sidebar_configure(self, _event=None) -> None:
         self.sidebar_canvas.configure(scrollregion=self.sidebar_canvas.bbox("all"))
@@ -444,8 +535,19 @@ class OrigamiCounterApp:
     def on_sidebar_canvas_configure(self, event) -> None:
         self.sidebar_canvas.itemconfigure(self.sidebar_window, width=event.width)
 
+    def on_image_list_mousewheel(self, event) -> str:
+        self.image_list.yview_scroll(-1 * int(event.delta / 120), "units")
+        return "break"
+
+    def on_label_summary_mousewheel(self, event) -> str:
+        self.label_summary.yview_scroll(-1 * int(event.delta / 120), "units")
+        return "break"
+
     def on_global_mousewheel(self, event) -> None:
         if not hasattr(self, "sidebar_canvas"):
+            return
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        if widget in {getattr(self, "image_list", None), getattr(self, "label_summary", None)}:
             return
         x = self.sidebar_canvas.winfo_pointerx()
         y = self.sidebar_canvas.winfo_pointery()
@@ -1083,22 +1185,28 @@ class OrigamiCounterApp:
             messagebox.showerror("Load failed", f"{exc}\n\n{traceback.format_exc()}")
 
     def classify_current(self) -> None:
+        if self.apply_classifier_to_current(show_messages=True):
+            self.redraw()
+
+    def apply_classifier_to_current(self, show_messages: bool = True) -> bool:
         if self.model is None:
-            messagebox.showwarning("No classifier", "Train a classifier first.")
-            return
+            if show_messages:
+                messagebox.showwarning("No classifier", "Train a classifier first.")
+            return False
         if self.current_image is None:
-            return
+            return False
         if not self.objects:
             self.detect_current(silent=True)
         if not self.objects:
-            return
+            return False
         features = np.asarray([obj.features for obj in self.objects], dtype=np.float32)
         try:
             predictions = self.model.predict(features)
             probabilities = self.model.predict_proba(features)
         except ValueError as exc:
-            messagebox.showwarning("Retrain classifier", f"The saved classifier is not compatible with the current scale-aware features. Please train again.\n\n{exc}")
-            return
+            if show_messages:
+                messagebox.showwarning("Retrain classifier", f"The saved classifier is not compatible with the current scale-aware features. Please train again.\n\n{exc}")
+            return False
         key = image_key(self.current_image)
         stored = self.labels.setdefault(key, {})
         accepted = 0
@@ -1117,7 +1225,151 @@ class OrigamiCounterApp:
         self.refresh_label_summary()
         self.status.set(f"Classified {len(self.objects)} origami. Added {accepted} bootstrap labels; kept {kept_manual} existing manual labels.")
         self.update_counts_text()
-        self.redraw()
+        return True
+
+    def current_counts_row(self) -> dict[str, str | int]:
+        if self.current_image is None:
+            raise ValueError("No image is loaded.")
+        counts = {state: 0 for state in self.states}
+        for obj in self.objects:
+            label = obj.label or obj.prediction
+            if label:
+                counts[label] = counts.get(label, 0) + 1
+        scale_info = self.current_scale_info(self.rgb, self.current_image)
+        row: dict[str, str | int] = {
+            "date_folder": self.current_image.parent.name,
+            "image": self.current_image.name,
+            "path": str(self.current_image),
+            "pixels_per_um": f"{scale_info.pixels_per_um:.6g}",
+            "total_detected": len(self.objects),
+        }
+        for state in self.states:
+            row[state] = counts.get(state, 0)
+        return row
+
+    def annotated_image(self, rgb: np.ndarray | None = None, objects: list[OrigamiObject] | None = None) -> Image.Image:
+        image_rgb = rgb if rgb is not None else self.rgb
+        image_objects = objects if objects is not None else self.objects
+        if image_rgb is None:
+            raise ValueError("No image is loaded.")
+        image = Image.fromarray(image_rgb).convert("RGB")
+        draw = ImageDraw.Draw(image)
+        for obj in image_objects:
+            minr, minc, maxr, maxc = obj.bbox
+            label = obj.label or obj.prediction
+            color = state_color(label, self.states) if label else UNLABELED_COLOR
+            draw.rectangle((minc, minr, maxc, maxr), outline=color, width=3)
+            if label:
+                text = str(label)
+                if obj.confidence is not None and obj.prediction and not obj.label:
+                    text = f"{label} {obj.confidence:.2f}"
+                draw.text((minc + 3, minr + 3), text, fill=color)
+        return image
+
+    def export_current_results(self) -> None:
+        if self.current_image is None:
+            return
+        if not self.apply_classifier_to_current(show_messages=True):
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.current_image.stem)
+        output_dir = self.output_dir / CURRENT_RESULTS_DIR / f"{stem}_{timestamp}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        row = self.current_counts_row()
+        csv_path = output_dir / f"{stem}_counts.csv"
+        fieldnames = ["date_folder", "image", "path", "pixels_per_um", "total_detected", *self.states]
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerow(row)
+
+        original_copy = output_dir / self.current_image.name
+        Image.fromarray(self.rgb).save(original_copy)
+        annotated_copy = output_dir / f"{stem}_annotated.png"
+        self.annotated_image().save(annotated_copy)
+        self.status.set(f"Exported current results to {output_dir}.")
+        messagebox.showinfo("Current results exported", f"Saved counts CSV and image copies to:\n{output_dir}")
+
+    def classify_path(self, path: Path) -> tuple[np.ndarray, list[OrigamiObject], dict[str, str | int]]:
+        if self.model is None:
+            raise ValueError("Train or load a classifier first.")
+        rgb = load_rgb(path)
+        min_area, max_area, scale_info = self.pixel_area_bounds(rgb, path)
+        objects = detect_origami(rgb, min_area, max_area, float(self.threshold_bias.get()), scale_info.pixels_per_um)
+        counts = {state: 0 for state in self.states}
+        if objects:
+            features = np.asarray([obj.features for obj in objects], dtype=np.float32)
+            predictions = self.model.predict(features)
+            probabilities = self.model.predict_proba(features)
+            for obj, pred, probs in zip(objects, predictions, probabilities):
+                obj.prediction = str(pred)
+                obj.label = obj.prediction
+                obj.confidence = float(np.max(probs))
+                counts[obj.label] = counts.get(obj.label, 0) + 1
+        row: dict[str, str | int] = {
+            "date_folder": path.parent.name,
+            "image": path.name,
+            "path": str(path),
+            "pixels_per_um": f"{scale_info.pixels_per_um:.6g}",
+            "total_detected": len(objects),
+        }
+        for state in self.states:
+            row[state] = counts.get(state, 0)
+        return rgb, objects, row
+
+    def write_image_result_folder(self, path: Path, rgb: np.ndarray, objects: list[OrigamiObject], row: dict[str, str | int], parent_dir: Path) -> Path:
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem)
+        output_dir = parent_dir / stem
+        suffix = 2
+        while output_dir.exists():
+            output_dir = parent_dir / f"{stem}_{suffix}"
+            suffix += 1
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        fieldnames = ["date_folder", "image", "path", "pixels_per_um", "total_detected", *self.states]
+        with (output_dir / f"{stem}_counts.csv").open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerow(row)
+        Image.fromarray(rgb).save(output_dir / path.name)
+        self.annotated_image(rgb, objects).save(output_dir / f"{stem}_annotated.png")
+        return output_dir
+
+    def classify_export_all_images(self) -> None:
+        if self.model is None:
+            messagebox.showwarning("No classifier", "Train or load a classifier first.")
+            return
+        if not self.images:
+            messagebox.showwarning("No images", "Open a root folder with origami PNG images first.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = self.output_dir / CURRENT_RESULTS_DIR / f"all_images_{timestamp}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        rows = []
+        try:
+            for idx, path in enumerate(self.images, start=1):
+                self.status.set(f"Classifying/exporting {idx}/{len(self.images)}: {path.name}")
+                self.root.update_idletasks()
+                rgb, objects, row = self.classify_path(path)
+                self.write_image_result_folder(path, rgb, objects, row, output_dir)
+                rows.append(row)
+        except ValueError as exc:
+            messagebox.showwarning("Classify/export failed", str(exc))
+            return
+        except Exception as exc:
+            messagebox.showerror("Classify/export failed", f"{exc}\n\n{traceback.format_exc()}")
+            return
+
+        summary_path = output_dir / "all_image_counts.csv"
+        fieldnames = ["date_folder", "image", "path", "pixels_per_um", "total_detected", *self.states]
+        with summary_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        self.status.set(f"Classified and exported {len(rows)} images to {output_dir}.")
+        messagebox.showinfo("Classify/export complete", f"Saved per-image folders and summary CSV to:\n{output_dir}")
 
     def update_counts_text(self, use_predictions: bool = False) -> None:
         counts: dict[str, int] = {}
@@ -1131,6 +1383,431 @@ class OrigamiCounterApp:
             self.counts_text.set("\n".join(lines))
         else:
             self.counts_text.set(f"Detected: {len(self.objects)}")
+
+    def plot_counts_csv(self) -> None:
+        csv_path = filedialog.askopenfilename(
+            initialdir=self.output_dir,
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not csv_path:
+            return
+        try:
+            output_dir = self.generate_count_plots(Path(csv_path))
+            self.status.set(f"Generated plots in {output_dir}.")
+            messagebox.showinfo("Plots generated", f"Saved plots and metrics to:\n{output_dir}")
+        except Exception as exc:
+            messagebox.showerror("Plotting failed", f"{exc}\n\n{traceback.format_exc()}")
+
+    def generate_count_plots(self, csv_path: Path) -> Path:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        with csv_path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            fieldnames = reader.fieldnames or []
+        if not rows:
+            raise ValueError("The selected CSV has no rows.")
+
+        meta_columns = {"date_folder", "image", "path", "pixels_per_um", "total_detected"}
+        state_columns = []
+        for field in fieldnames:
+            if field in meta_columns or field.startswith("fraction_"):
+                continue
+            try:
+                [float(row.get(field, 0) or 0) for row in rows]
+            except ValueError:
+                continue
+            state_columns.append(field)
+        if not state_columns:
+            raise ValueError("No state count columns were found in the selected CSV.")
+
+        labels = [row.get("image") or f"image_{idx + 1}" for idx, row in enumerate(rows)]
+        short_labels = [label[:28] + ("..." if len(label) > 28 else "") for label in labels]
+        counts = np.asarray([[float(row.get(state, 0) or 0) for state in state_columns] for row in rows], dtype=float)
+        totals = counts.sum(axis=1)
+        totals_for_fraction = np.where(totals > 0, totals, 1)
+        fractions = counts / totals_for_fraction[:, None]
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = self.output_dir / PLOTS_DIR / f"{csv_path.stem}_{timestamp}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        metrics_path = output_dir / "fraction_metrics.csv"
+        with metrics_path.open("w", newline="", encoding="utf-8") as f:
+            metric_fields = ["image", "path", "total_count", *[f"count_{s}" for s in state_columns], *[f"fraction_{s}" for s in state_columns]]
+            writer = csv.DictWriter(f, fieldnames=metric_fields)
+            writer.writeheader()
+            for idx, row in enumerate(rows):
+                metric_row = {
+                    "image": labels[idx],
+                    "path": row.get("path", ""),
+                    "total_count": f"{totals[idx]:.6g}",
+                }
+                for j, state in enumerate(state_columns):
+                    metric_row[f"count_{state}"] = f"{counts[idx, j]:.6g}"
+                    metric_row[f"fraction_{state}"] = f"{fractions[idx, j]:.6g}"
+                writer.writerow(metric_row)
+
+        x = np.arange(len(rows))
+        fig_width = max(8, min(24, len(rows) * 0.55 + 4))
+
+        plt.figure(figsize=(fig_width, 5))
+        bottom = np.zeros(len(rows))
+        for j, state in enumerate(state_columns):
+            plt.bar(x, counts[:, j], bottom=bottom, label=state, color=STATE_COLORS[j % len(STATE_COLORS)])
+            bottom += counts[:, j]
+        plt.xticks(x, short_labels, rotation=45, ha="right")
+        plt.ylabel("Origami count")
+        plt.title("Origami counts by image")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(output_dir / "counts_stacked.png", dpi=180)
+        plt.close()
+
+        plt.figure(figsize=(fig_width, 5))
+        bottom = np.zeros(len(rows))
+        for j, state in enumerate(state_columns):
+            plt.bar(x, fractions[:, j], bottom=bottom, label=state, color=STATE_COLORS[j % len(STATE_COLORS)])
+            bottom += fractions[:, j]
+        plt.xticks(x, short_labels, rotation=45, ha="right")
+        plt.ylim(0, 1)
+        plt.ylabel("Fraction of classified origami")
+        plt.title("State fractions by image")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(output_dir / "fractions_stacked.png", dpi=180)
+        plt.close()
+
+        plt.figure(figsize=(fig_width, 4))
+        plt.bar(x, totals, color="#555555")
+        plt.xticks(x, short_labels, rotation=45, ha="right")
+        plt.ylabel("Total classified origami")
+        plt.title("Total origami detected/classified")
+        plt.tight_layout()
+        plt.savefig(output_dir / "total_counts.png", dpi=180)
+        plt.close()
+
+        if len(state_columns) >= 2:
+            a_idx, b_idx = 0, 1
+            plt.figure(figsize=(6, 6))
+            plt.scatter(fractions[:, a_idx], fractions[:, b_idx], s=np.maximum(totals, 10) * 3, alpha=0.75)
+            for idx, label in enumerate(short_labels):
+                plt.annotate(str(idx + 1), (fractions[idx, a_idx], fractions[idx, b_idx]), fontsize=8)
+            plt.xlabel(f"Fraction {state_columns[a_idx]}")
+            plt.ylabel(f"Fraction {state_columns[b_idx]}")
+            plt.title(f"{state_columns[a_idx]} vs {state_columns[b_idx]} fraction")
+            plt.xlim(-0.03, 1.03)
+            plt.ylim(-0.03, 1.03)
+            plt.grid(True, alpha=0.25)
+            plt.tight_layout()
+            plt.savefig(output_dir / f"fraction_{state_columns[a_idx]}_vs_{state_columns[b_idx]}.png", dpi=180)
+            plt.close()
+
+        return output_dir
+
+    def plot_image_from_current_figure(self) -> Image.Image:
+        import matplotlib.pyplot as plt
+
+        buffer = io.BytesIO()
+        plt.savefig(buffer, format="png", dpi=150)
+        plt.close()
+        buffer.seek(0)
+        return Image.open(buffer).convert("RGB")
+
+    def build_count_plot_previews(self, csv_path: Path) -> dict[str, Image.Image]:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        with csv_path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            fieldnames = reader.fieldnames or []
+        if not rows:
+            raise ValueError("The selected CSV has no rows.")
+
+        state_columns = self.count_state_columns(fieldnames, rows)
+        if not state_columns:
+            raise ValueError("No state count columns were found in the selected CSV.")
+
+        labels = [row.get("image") or f"image_{idx + 1}" for idx, row in enumerate(rows)]
+        short_labels = [label[:28] + ("..." if len(label) > 28 else "") for label in labels]
+        counts = np.asarray([[float(row.get(state, 0) or 0) for state in state_columns] for row in rows], dtype=float)
+        totals = counts.sum(axis=1)
+        totals_for_fraction = np.where(totals > 0, totals, 1)
+        fractions = counts / totals_for_fraction[:, None]
+        x = np.arange(len(rows))
+        fig_width = max(8, min(24, len(rows) * 0.55 + 4))
+
+        previews: dict[str, Image.Image] = {}
+
+        plt.figure(figsize=(fig_width, 5))
+        bottom = np.zeros(len(rows))
+        for j, state in enumerate(state_columns):
+            plt.bar(x, counts[:, j], bottom=bottom, label=state, color=STATE_COLORS[j % len(STATE_COLORS)])
+            bottom += counts[:, j]
+        plt.xticks(x, short_labels, rotation=45, ha="right")
+        plt.ylabel("Origami count")
+        plt.title("Origami counts by image")
+        plt.legend()
+        plt.tight_layout()
+        previews["counts_stacked.png"] = self.plot_image_from_current_figure()
+
+        plt.figure(figsize=(fig_width, 5))
+        bottom = np.zeros(len(rows))
+        for j, state in enumerate(state_columns):
+            plt.bar(x, fractions[:, j], bottom=bottom, label=state, color=STATE_COLORS[j % len(STATE_COLORS)])
+            bottom += fractions[:, j]
+        plt.xticks(x, short_labels, rotation=45, ha="right")
+        plt.ylim(0, 1)
+        plt.ylabel("Fraction of classified origami")
+        plt.title("State fractions by image")
+        plt.legend()
+        plt.tight_layout()
+        previews["fractions_stacked.png"] = self.plot_image_from_current_figure()
+
+        plt.figure(figsize=(fig_width, 4))
+        plt.bar(x, totals, color="#555555")
+        plt.xticks(x, short_labels, rotation=45, ha="right")
+        plt.ylabel("Total classified origami")
+        plt.title("Total origami detected/classified")
+        plt.tight_layout()
+        previews["total_counts.png"] = self.plot_image_from_current_figure()
+
+        if len(state_columns) >= 2:
+            a_idx, b_idx = 0, 1
+            plt.figure(figsize=(6, 6))
+            plt.scatter(fractions[:, a_idx], fractions[:, b_idx], s=np.maximum(totals, 10) * 3, alpha=0.75)
+            for idx, _label in enumerate(short_labels):
+                plt.annotate(str(idx + 1), (fractions[idx, a_idx], fractions[idx, b_idx]), fontsize=8)
+            plt.xlabel(f"Fraction {state_columns[a_idx]}")
+            plt.ylabel(f"Fraction {state_columns[b_idx]}")
+            plt.title(f"{state_columns[a_idx]} vs {state_columns[b_idx]} fraction")
+            plt.xlim(-0.03, 1.03)
+            plt.ylim(-0.03, 1.03)
+            plt.grid(True, alpha=0.25)
+            plt.tight_layout()
+            previews[f"fraction_{state_columns[a_idx]}_vs_{state_columns[b_idx]}.png"] = self.plot_image_from_current_figure()
+
+        return previews
+
+    def parse_origami_label(self, image_name: str) -> str:
+        match = re.search(r"origami([0-9]+f?)_", image_name, re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
+        match = re.search(r"origami([0-9]+f?)", image_name, re.IGNORECASE)
+        return match.group(1).lower() if match else "unknown"
+
+    def count_state_columns(self, fieldnames: list[str], rows: list[dict[str, str]]) -> list[str]:
+        meta_columns = {"date_folder", "image", "path", "pixels_per_um", "total_detected"}
+        state_columns = []
+        for field in fieldnames:
+            if field in meta_columns or field.startswith("fraction_") or field.startswith("count_"):
+                continue
+            try:
+                [float(row.get(field, 0) or 0) for row in rows]
+            except ValueError:
+                continue
+            state_columns.append(field)
+        return state_columns
+
+    def read_counts_from_all_images_folder(self, folder: Path) -> tuple[list[dict[str, str]], list[str], Path]:
+        summary = folder / "all_image_counts.csv"
+        if summary.exists():
+            with summary.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                fieldnames = reader.fieldnames or []
+            return rows, fieldnames, summary
+
+        rows: list[dict[str, str]] = []
+        fieldnames: list[str] = []
+        for csv_path in sorted(folder.rglob("*_counts.csv")):
+            if csv_path.name == "all_image_counts.csv":
+                continue
+            with csv_path.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    rows.append(row)
+                for field in reader.fieldnames or []:
+                    if field not in fieldnames:
+                        fieldnames.append(field)
+        if not rows:
+            raise ValueError("No counts CSV files were found in the selected folder.")
+
+        combined = folder / "analysis_loaded_counts.csv"
+        with combined.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        return rows, fieldnames, combined
+
+    def load_analysis_folder(self) -> None:
+        folder = filedialog.askdirectory(initialdir=self.output_dir / CURRENT_RESULTS_DIR)
+        if not folder:
+            return
+        try:
+            rows, fieldnames, csv_path = self.read_counts_from_all_images_folder(Path(folder))
+            self.populate_analysis(rows, fieldnames, csv_path)
+        except Exception as exc:
+            messagebox.showerror("Analysis load failed", f"{exc}\n\n{traceback.format_exc()}")
+
+    def populate_analysis(self, rows: list[dict[str, str]], fieldnames: list[str], csv_path: Path) -> None:
+        state_columns = self.count_state_columns(fieldnames, rows)
+        if not state_columns:
+            raise ValueError("No state count columns were found.")
+        primary = state_columns[0]
+        secondary = state_columns[1] if len(state_columns) > 1 else None
+        self.analysis_csv_path = csv_path
+        self.analysis_rows = []
+        self.analysis_table.delete(*self.analysis_table.get_children())
+        self.analysis_summary.delete(0, END)
+
+        grouped: dict[str, dict[str, float]] = {}
+        for row in rows:
+            image_name = row.get("image", "")
+            origami_label = self.parse_origami_label(image_name)
+            counts = {state: float(row.get(state, 0) or 0) for state in state_columns}
+            total = sum(counts.values())
+            primary_fraction = counts[primary] / total if total else 0.0
+            secondary_fraction = counts[secondary] / total if total and secondary else 0.0
+            ratio = counts[primary] / counts[secondary] if secondary and counts[secondary] else float("inf") if counts[primary] else 0.0
+            display_ratio = "inf" if math.isinf(ratio) else f"{ratio:.3f}"
+            self.analysis_table.insert(
+                "",
+                END,
+                values=("image", origami_label, image_name, f"{total:.0f}", f"{primary_fraction:.3f}", f"{secondary_fraction:.3f}", display_ratio),
+            )
+            metric_row: dict[str, str | float] = {
+                "kind": "image",
+                "origami_label": origami_label,
+                "image": image_name,
+                "path": row.get("path", ""),
+                "total": total,
+                f"fraction_{primary}": primary_fraction,
+            }
+            if secondary:
+                metric_row[f"fraction_{secondary}"] = secondary_fraction
+                metric_row[f"{primary}_to_{secondary}_ratio"] = ratio
+            for state, count in counts.items():
+                metric_row[f"count_{state}"] = count
+            self.analysis_rows.append(metric_row)
+
+            group = grouped.setdefault(origami_label, {"n_images": 0.0, "total": 0.0, **{state: 0.0 for state in state_columns}})
+            group["n_images"] += 1
+            group["total"] += total
+            for state, count in counts.items():
+                group[state] += count
+
+        self.analysis_table.insert("", END, values=("", "", "", "", "", "", ""))
+        for origami_label, group in sorted(grouped.items(), key=lambda item: item[0]):
+            total = group["total"]
+            primary_fraction = group[primary] / total if total else 0.0
+            secondary_fraction = group[secondary] / total if total and secondary else 0.0
+            ratio = group[primary] / group[secondary] if secondary and group[secondary] else float("inf") if group[primary] else 0.0
+            display_ratio = "inf" if math.isinf(ratio) else f"{ratio:.3f}"
+            self.analysis_table.insert(
+                "",
+                END,
+                values=("group", origami_label, f"{int(group['n_images'])} image(s)", f"{total:.0f}", f"{primary_fraction:.3f}", f"{secondary_fraction:.3f}", display_ratio),
+            )
+
+        metrics_path = csv_path.parent / "analysis_metrics.csv"
+        metric_fields = sorted({key for metric_row in self.analysis_rows for key in metric_row.keys()})
+        with metrics_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=metric_fields)
+            writer.writeheader()
+            writer.writerows(self.analysis_rows)
+
+        self.analysis_summary.insert(END, f"Loaded: {csv_path.parent}")
+        self.analysis_summary.insert(END, f"Images: {len(rows)}")
+        self.analysis_summary.insert(END, f"Origami labels: {', '.join(sorted(grouped.keys()))}")
+        self.analysis_summary.insert(END, f"States: {', '.join(state_columns)}")
+        self.analysis_summary.insert(END, f"Primary metric: fraction {primary}")
+        if secondary:
+            self.analysis_summary.insert(END, f"Comparison metric: fraction {primary} vs {secondary}, ratio {primary}/{secondary}")
+        self.analysis_summary.insert(END, f"Saved metrics: {metrics_path.name}")
+        self.analysis_status.set(f"Loaded {len(rows)} image rows from {csv_path.name}.")
+
+    def generate_analysis_plots(self) -> None:
+        if self.analysis_csv_path is None:
+            messagebox.showinfo("No analysis folder loaded", "Load an all_images folder first.")
+            return
+        try:
+            output_dir = self.generate_count_plots(self.analysis_csv_path)
+            self.analysis_status.set(f"Generated plots in {output_dir}.")
+            messagebox.showinfo("Plots generated", f"Saved plots to:\n{output_dir}")
+        except Exception as exc:
+            messagebox.showerror("Plotting failed", f"{exc}\n\n{traceback.format_exc()}")
+
+    def generate_analysis_plot_previews(self) -> None:
+        if self.analysis_csv_path is None:
+            messagebox.showinfo("No analysis folder loaded", "Load an all_images folder first.")
+            return
+        try:
+            self.plot_previews = self.build_count_plot_previews(self.analysis_csv_path)
+            self.plot_list.delete(0, END)
+            for name in self.plot_previews:
+                self.plot_list.insert(END, name)
+            if self.plot_previews:
+                self.plot_list.selection_set(0)
+                self.show_plot_preview(next(iter(self.plot_previews)))
+            self.analysis_status.set(f"Generated {len(self.plot_previews)} plot preview(s). Select one to view or save.")
+        except Exception as exc:
+            messagebox.showerror("Plot preview failed", f"{exc}\n\n{traceback.format_exc()}")
+
+    def selected_plot_preview_name(self) -> str | None:
+        selection = self.plot_list.curselection()
+        if not selection:
+            return None
+        return self.plot_list.get(selection[0])
+
+    def on_plot_preview_select(self, _event=None) -> None:
+        name = self.selected_plot_preview_name()
+        if name:
+            self.show_plot_preview(name)
+
+    def show_plot_preview(self, name: str) -> None:
+        image = self.plot_previews.get(name)
+        if image is None:
+            return
+        preview = ImageOps.contain(image, (900, 360))
+        self.plot_preview_photo = ImageTk.PhotoImage(preview)
+        self.plot_preview_label.configure(image=self.plot_preview_photo, text="")
+
+    def save_selected_plot_preview(self) -> None:
+        name = self.selected_plot_preview_name()
+        if not name or name not in self.plot_previews:
+            messagebox.showinfo("No plot selected", "Generate plot previews and select one plot first.")
+            return
+        path = filedialog.asksaveasfilename(
+            initialdir=self.output_dir / PLOTS_DIR,
+            initialfile=name,
+            defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.plot_previews[name].save(path)
+        self.analysis_status.set(f"Saved plot: {path}")
+
+    def save_all_plot_previews(self) -> None:
+        if not self.plot_previews:
+            messagebox.showinfo("No plot previews", "Generate plot previews first.")
+            return
+        folder = filedialog.askdirectory(initialdir=self.output_dir / PLOTS_DIR)
+        if not folder:
+            return
+        folder_path = Path(folder)
+        folder_path.mkdir(parents=True, exist_ok=True)
+        for name, image in self.plot_previews.items():
+            image.save(folder_path / name)
+        self.analysis_status.set(f"Saved {len(self.plot_previews)} plot(s) to {folder_path}.")
+        messagebox.showinfo("Plots saved", f"Saved {len(self.plot_previews)} plot(s) to:\n{folder_path}")
 
     def batch_count(self) -> None:
         if self.model is None:

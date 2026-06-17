@@ -35,6 +35,22 @@ The **Training Data Images** panel shows every image that has been explicitly ad
 
 Use **Export Classifier** after training to save a portable `.joblib` model. On a later day, start the app, click **Load Classifier**, choose that `.joblib` file, then detect/classify new images.
 
+## Export Results and Plots
+
+After classifying the current image, click **Export Current Results** to save:
+
+- a one-row counts CSV
+- a copy of the original PNG
+- an annotated PNG with colored classification boxes
+
+These are written under `analysis_output/classified_images/`.
+
+Click **Classify + Export All Images** to run the loaded classifier on every image in the current root folder. This writes an `all_images_<timestamp>/` folder containing one result folder per image plus `all_image_counts.csv` with all counts in one table.
+
+Click **Plot Counts CSV** to load a saved counts CSV, including a single-image export or `origami_counts.csv` from **Batch Count**. The app writes plots and a fraction metrics CSV under `analysis_output/plots/`, including count stacks, fraction stacks, total counts, and a first-vs-second-state fraction scatter.
+
+The **Analysis** tab can load an `all_images_<timestamp>` folder from **Classify + Export All Images**. It reads the combined counts CSV, extracts the origami label from names such as `origami1_` and `origami12f_`, shows per-image and grouped metrics, and saves `analysis_metrics.csv` in the loaded folder. Use **Generate Plot Previews** to view plots in the GUI, then save only the selected plot or all previewed plots.
+
 ## Bootstrap training
 
 You can iteratively improve a classifier on one image:
