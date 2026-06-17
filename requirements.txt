@@ -1,0 +1,5 @@
+pillow>=10.4
+numpy>=2.0
+scikit-image>=0.25
+scikit-learn>=1.6
+joblib>=1.4
