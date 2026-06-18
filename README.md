@@ -4,12 +4,33 @@ This folder now includes an interactive desktop tool for labeling DNA origami st
 
 ## Setup
 
+macOS:
+
+```bash
+python3 -m venv .venv
+./.venv/bin/python -m pip install -r requirements.txt
+```
+
+Windows:
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
 ## Run
+
+macOS:
+
+Double-click `run_origami_counter.command` in Finder, or run:
+
+```bash
+./run_origami_counter.command
+```
+
+Windows:
+
+Double-click `run_origami_counter.bat`, or run:
 
 ```powershell
 .\.venv\Scripts\python origami_counter_app.py
@@ -30,6 +51,8 @@ python -m venv .venv
 11. Click **Classify Image** to count the current image, or **Batch Count** to process all images.
 
 The classifier uses scale-normalized size features from the `.spm` scan size when available, so labels from one zoom level can be applied to any other zoom level.
+
+If your images are still raw Nanoscope `.spm` files, click **Import SPM Folder** and choose the folder containing them. The app reads the height channel, applies plane and line flattening, writes colored flattened PNGs using NanoScope Color Table 12 with a z-height colorbar and scale bar to `analysis_output/spm_png_<timestamp>/`, copies each source `.spm` beside its PNG for scan-size metadata, and loads the converted PNG folder for classification.
 
 The **Training Data Images** panel shows every image that has been explicitly added to training data and the number of committed labels for that image. Double-click a row, or select it and click **Open**, to jump to that image. Select a row and click **Clear** to remove that image from the training data list.
 
