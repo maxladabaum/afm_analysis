@@ -3,6 +3,12 @@ set -u
 
 cd "$(dirname "$0")" || exit 1
 
+if [ ! -f "requirements.txt" ]; then
+    echo "requirements.txt was not found next to this launcher."
+    read -r -p "Press Return to close this window..."
+    exit 1
+fi
+
 PYTHON_CMD=""
 if command -v python3 >/dev/null 2>&1; then
     PYTHON_CMD="python3"
@@ -23,6 +29,14 @@ if [ ! -x ".venv/bin/python" ]; then
         read -r -p "Press Return to close this window..."
         exit 1
     fi
+
+    echo "Preparing pip..."
+    ".venv/bin/python" -m pip install --upgrade pip
+    if [ $? -ne 0 ]; then
+        echo "Failed to prepare pip in the Python environment."
+        read -r -p "Press Return to close this window..."
+        exit 1
+    fi
 fi
 
 echo "Checking macOS Tkinter support..."
@@ -37,13 +51,6 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "Installing or checking dependencies..."
-".venv/bin/python" -m pip install --upgrade pip
-if [ $? -ne 0 ]; then
-    echo "Failed to update pip."
-    read -r -p "Press Return to close this window..."
-    exit 1
-fi
-
 ".venv/bin/python" -m pip install -r requirements.txt
 if [ $? -ne 0 ]; then
     echo "Failed to install dependencies."
