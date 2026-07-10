@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import colorsys
 import csv
 import io
 import json
@@ -23,13 +24,16 @@ from sklearn.preprocessing import StandardScaler
 
 APP_TITLE = "DNA Origami AFM Counter"
 OUTPUT_DIR = "analysis_output"
+CONVERTED_IMAGES_DIR = "converted_images"
 LABELS_FILE = "labels.json"
 MODEL_FILE = "origami_state_classifier.joblib"
 COUNTS_FILE = "origami_counts.csv"
+DETECT_COUNTS_FILE = "origami_detect_counts.csv"
 CURRENT_RESULTS_DIR = "classified_images"
 PLOTS_DIR = "plots"
 THUMB_MAX = 980
 MODEL_FORMAT_VERSION = 2
+POLYMER_ANALYSIS_PIXELS_PER_UM = 900.0
 UNLABELED_COLOR = "#45a3ff"
 STATE_COLORS = [
     "#ff5a5f",
@@ -60,6 +64,28 @@ class OrigamiObject:
 
 
 @dataclass
+class PolymerObject:
+    object_id: int
+    points: list[tuple[float, float]]  # image x, y points ordered along the contour
+    length_nm: float
+    end_to_end_nm: float
+    segment_count: int
+    excluded_reason: str = ""
+
+
+@dataclass
+class PolymerAnalysisResult:
+    params: tuple[float, float, float]
+    objects: list[PolymerObject]
+    msd_rows: list[dict[str, float]]
+    persistence_nm: float | None
+    fit_r2: float | None
+    status_text: str
+    figure_2b_image: Image.Image | None = None
+    figure_c_image: Image.Image | None = None
+
+
+@dataclass
 class ScaleInfo:
     pixels_per_um: float
     bar_pixels: float
@@ -79,22 +105,69 @@ class SpmImageSection:
     frame_direction: str = ""
 
 
+@dataclass
+class SpmRenderSettings:
+    lower_iqr_multiplier: float = 1.5
+    upper_iqr_multiplier: float = 1.5
+    manual_lo: float | None = None
+    manual_hi: float | None = None
+
+
 def image_key(path: Path) -> str:
     return str(path.resolve())
 
 
 def discover_images(root: Path) -> list[Path]:
     images = []
-    for path in root.rglob("origami*.png"):
-        if path.is_file():
+    image_exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+    for path in root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in image_exts:
+            try:
+                relative_parts = path.relative_to(root).parts
+            except ValueError:
+                relative_parts = path.parts
+            if OUTPUT_DIR in relative_parts or CONVERTED_IMAGES_DIR in relative_parts:
+                continue
             images.append(path)
-    return sorted(images, key=lambda p: (p.parent.name, p.name))
+    return sorted(images, key=lambda p: p.name)
+
+
+def supported_image_extensions_text() -> str:
+    return "PNG, JPG, JPEG, TIF, and TIFF"
+
+
+def discover_spm_files(root: Path) -> list[Path]:
+    spm_paths = []
+    for path in root.rglob("*.spm"):
+        if not path.is_file():
+            continue
+        try:
+            relative_parts = path.relative_to(root).parts
+        except ValueError:
+            relative_parts = path.parts
+        if OUTPUT_DIR in relative_parts or CONVERTED_IMAGES_DIR in relative_parts:
+            continue
+        spm_paths.append(path)
+    return sorted(spm_paths)
 
 
 def state_color(state: str, states: list[str]) -> str:
     if state in states:
         return STATE_COLORS[states.index(state) % len(STATE_COLORS)]
     return STATE_COLORS[abs(hash(state)) % len(STATE_COLORS)]
+
+
+def polymer_color_rgb(polymer: PolymerObject) -> tuple[int, int, int]:
+    if polymer.excluded_reason:
+        return (255, 90, 95)
+    hue = (0.08 + polymer.object_id * 0.61803398875) % 1.0
+    red, green, blue = colorsys.hsv_to_rgb(hue, 0.78, 0.96)
+    return (int(round(red * 255)), int(round(green * 255)), int(round(blue * 255)))
+
+
+def polymer_color_hex(polymer: PolymerObject) -> str:
+    red, green, blue = polymer_color_rgb(polymer)
+    return f"#{red:02x}{green:02x}{blue:02x}"
 
 
 def load_rgb(path: Path) -> np.ndarray:
@@ -106,6 +179,16 @@ def rgb_to_grayscale(rgb: np.ndarray) -> np.ndarray:
     return exposure.rescale_intensity(arr, in_range="image", out_range=(0.0, 1.0))
 
 
+def pil_grayscale_float(rgb: np.ndarray, scale: float = 1.0) -> np.ndarray:
+    image = Image.fromarray(rgb)
+    if scale < 1.0:
+        width = max(1, int(round(rgb.shape[1] * scale)))
+        height = max(1, int(round(rgb.shape[0] * scale)))
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+    gray = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+    return exposure.rescale_intensity(gray, in_range="image", out_range=(0.0, 1.0))
+
+
 def paired_spm_path(png_path: Path) -> Path:
     if png_path.name.lower().endswith(".spm.png"):
         candidate = Path(str(png_path)[:-4])
@@ -114,6 +197,19 @@ def paired_spm_path(png_path: Path) -> Path:
         name = png_path.name
         if name.lower().endswith("_1.spm.png"):
             return png_path.with_name(name[:-10] + ".spm")
+        return candidate
+    if png_path.name.lower().endswith(".spm.jpg") or png_path.name.lower().endswith(".spm.jpeg"):
+        name = png_path.name
+        suffix = ".jpg" if name.lower().endswith(".jpg") else ".jpeg"
+        candidate = Path(str(png_path)[: -len(suffix)])
+        if candidate.exists():
+            return candidate
+        if name.lower().endswith(f"_1.spm{suffix}"):
+            base = name[: -(len(f"_1.spm{suffix}"))]
+            for replacement in (f"{base}_post.spm", f"{base}.spm"):
+                replacement_path = png_path.with_name(replacement)
+                if replacement_path.exists():
+                    return replacement_path
         return candidate
     return png_path.with_suffix(".spm")
 
@@ -281,14 +377,25 @@ def height_to_uint8(height: np.ndarray) -> np.ndarray:
     return (scaled * 255).astype(np.uint8)
 
 
-def height_contrast_limits(height: np.ndarray) -> tuple[float, float]:
+def height_contrast_limits(height: np.ndarray, settings: SpmRenderSettings | None = None) -> tuple[float, float]:
     arr = np.asarray(height, dtype=np.float32)
     finite = arr[np.isfinite(arr)]
     if finite.size == 0:
         return 0.0, 1.0
-    # NanoScope auto display scaling permits tiny high/low outliers to saturate instead of
-    # letting one speck set the whole color range and darken the image.
-    lo, hi = np.percentile(finite, [0.01, 99.95])
+    if settings is None:
+        settings = SpmRenderSettings()
+    if settings.manual_lo is not None and settings.manual_hi is not None:
+        lo, hi = settings.manual_lo, settings.manual_hi
+    else:
+        # Focus the automatic display range on the inner quartile so isolated tall
+        # debris/noise saturates instead of darkening the full AFM image.
+        q1, q3 = np.percentile(finite, [25, 75])
+        iqr = q3 - q1
+        if np.isfinite(iqr) and iqr > 0:
+            lo = q1 - max(0.0, settings.lower_iqr_multiplier) * iqr
+            hi = q3 + max(0.0, settings.upper_iqr_multiplier) * iqr
+        else:
+            lo, hi = np.percentile(finite, [1, 99])
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
         lo, hi = float(finite.min()), float(finite.max())
     if hi <= lo:
@@ -341,9 +448,14 @@ def draw_spm_scale_bar(draw: ImageDraw.ImageDraw, image_width: int, image_height
     draw.text((x1, y + 8), label, fill=(0, 0, 0))
 
 
-def render_spm_png(height: np.ndarray, scan_size_um: float | None, z_nm_per_lsb: float | None = None) -> Image.Image:
+def render_spm_png(
+    height: np.ndarray,
+    scan_size_um: float | None,
+    z_nm_per_lsb: float | None = None,
+    settings: SpmRenderSettings | None = None,
+) -> Image.Image:
     flattened = flatten_spm_height(height)
-    lo, hi = height_contrast_limits(flattened)
+    lo, hi = height_contrast_limits(flattened, settings)
     scan_rgb = apply_height_colormap(flattened, lo, hi)
     scan = Image.fromarray(scan_rgb, mode="RGB")
     scan_w, scan_h = scan.size
@@ -380,10 +492,10 @@ def render_spm_png(height: np.ndarray, scan_size_um: float | None, z_nm_per_lsb:
     return canvas
 
 
-def convert_spm_to_png(spm_path: Path, png_path: Path) -> None:
+def convert_spm_to_png(spm_path: Path, png_path: Path, settings: SpmRenderSettings | None = None) -> None:
     height = read_spm_height_array(spm_path)
     png_path.parent.mkdir(parents=True, exist_ok=True)
-    render_spm_png(height, parse_spm_scan_size_um(spm_path), parse_spm_z_nm_per_lsb(spm_path)).save(png_path)
+    render_spm_png(height, parse_spm_scan_size_um(spm_path), parse_spm_z_nm_per_lsb(spm_path), settings).save(png_path)
 
 
 def format_um(value: float) -> str:
@@ -495,12 +607,19 @@ def scan_bbox(rgb: np.ndarray) -> tuple[int, int, int, int]:
     return tuple(int(v) for v in prop.bbox)
 
 
+def remove_small_objects_compat(binary: np.ndarray, size: int) -> np.ndarray:
+    return morphology.remove_small_objects(binary, max(1, int(size)))
+
+
+def remove_small_holes_compat(binary: np.ndarray, area: int) -> np.ndarray:
+    return morphology.remove_small_holes(binary, max(1, int(area)))
+
+
 def detect_origami(rgb: np.ndarray, min_area: int, max_area: int, threshold_bias: float, pixels_per_um: float | None = None) -> list[OrigamiObject]:
     minr0, minc0, maxr0, maxc0 = scan_bbox(rgb)
     if pixels_per_um is None:
         pixels_per_um = detect_scale_bar(rgb).pixels_per_um
-    gray_full = rgb_to_grayscale(rgb)
-    gray = gray_full[minr0:maxr0, minc0:maxc0]
+    gray = pil_grayscale_float(rgb[minr0:maxr0, minc0:maxc0])
     smooth = filters.gaussian(gray, sigma=1.0)
     try:
         threshold = filters.threshold_otsu(smooth)
@@ -509,8 +628,8 @@ def detect_origami(rgb: np.ndarray, min_area: int, max_area: int, threshold_bias
     binary_high = smooth > min(1.0, threshold + threshold_bias)
     binary_low = smooth < max(0.0, threshold - threshold_bias)
     binary = binary_high if binary_high.sum() <= binary_low.sum() else binary_low
-    binary = morphology.remove_small_objects(binary, max_size=max(4, min_area // 2))
-    binary = morphology.remove_small_holes(binary, max_size=max(8, min_area // 2))
+    binary = remove_small_objects_compat(binary, max(4, min_area // 2))
+    binary = remove_small_holes_compat(binary, max(8, min_area // 2))
     labels = measure.label(binary)
 
     objects: list[OrigamiObject] = []
@@ -531,15 +650,434 @@ def detect_origami(rgb: np.ndarray, min_area: int, max_area: int, threshold_bias
     return objects
 
 
+def ordered_skeleton_path(mask: np.ndarray) -> list[tuple[int, int]] | None:
+    coords = [tuple(map(int, coord)) for coord in np.argwhere(mask)]
+    if len(coords) < 2:
+        return None
+    coord_set = set(coords)
+    neighbors: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for r, c in coords:
+        node_neighbors = []
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                candidate = (r + dr, c + dc)
+                if candidate in coord_set:
+                    node_neighbors.append(candidate)
+        neighbors[(r, c)] = node_neighbors
+    endpoints = [node for node, node_neighbors in neighbors.items() if len(node_neighbors) == 1]
+    branchpoints = [node for node, node_neighbors in neighbors.items() if len(node_neighbors) > 2]
+    if len(endpoints) != 2 or branchpoints:
+        return None
+    start = endpoints[0]
+    path = [start]
+    previous = None
+    current = start
+    while True:
+        next_nodes = [node for node in neighbors[current] if node != previous]
+        if not next_nodes:
+            break
+        previous, current = current, next_nodes[0]
+        path.append(current)
+        if current == endpoints[1]:
+            break
+    if len(path) != len(coords):
+        return None
+    return path
+
+
+def path_length_px(points_xy: list[tuple[float, float]]) -> float:
+    if len(points_xy) < 2:
+        return 0.0
+    arr = np.asarray(points_xy, dtype=np.float32)
+    return float(np.linalg.norm(np.diff(arr, axis=0), axis=1).sum())
+
+
+def resample_polyline(points_xy: list[tuple[float, float]], spacing_px: float) -> np.ndarray:
+    arr = np.asarray(points_xy, dtype=np.float32)
+    if arr.shape[0] < 2:
+        return arr
+    segment_lengths = np.linalg.norm(np.diff(arr, axis=0), axis=1)
+    cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+    total = float(cumulative[-1])
+    if total <= 0:
+        return arr[:1]
+    spacing = max(float(spacing_px), 1e-6)
+    distances = np.arange(0.0, total + spacing * 0.5, spacing, dtype=np.float32)
+    if distances[-1] < total:
+        distances = np.append(distances, total)
+    x = np.interp(distances, cumulative, arr[:, 0])
+    y = np.interp(distances, cumulative, arr[:, 1])
+    return np.column_stack([x, y]).astype(np.float32)
+
+
+def wlc_mean_square_end_to_end_2d(contour_nm: np.ndarray, persistence_nm: float) -> np.ndarray:
+    lp = max(float(persistence_nm), 1e-9)
+    lc = np.asarray(contour_nm, dtype=np.float64)
+    return 4.0 * lp * lc * (1.0 - (2.0 * lp / np.maximum(lc, 1e-9)) * (1.0 - np.exp(-lc / (2.0 * lp))))
+
+
+def fit_persistence_length_2d(contour_separations_nm: np.ndarray, mean_square_nm2: np.ndarray) -> tuple[float, float]:
+    x = np.asarray(contour_separations_nm, dtype=np.float64)
+    y = np.asarray(mean_square_nm2, dtype=np.float64)
+    valid = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+    x = x[valid]
+    y = y[valid]
+    if x.size < 3:
+        raise ValueError("Need at least three contour-separation points to fit persistence length.")
+    lo = max(1.0, float(np.min(x)) / 20.0)
+    hi = max(lo * 1.1, float(np.max(x)) * 20.0)
+    grid = np.geomspace(lo, hi, 800)
+    errors = np.asarray([np.mean((wlc_mean_square_end_to_end_2d(x, lp) - y) ** 2) for lp in grid])
+    best = float(grid[int(np.argmin(errors))])
+    yhat = wlc_mean_square_end_to_end_2d(x, best)
+    ss_res = float(np.sum((y - yhat) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+    return best, r2
+
+
+def polymer_msd_table(polymers: list[PolymerObject], pixels_per_um: float, segment_nm: float) -> list[dict[str, float]]:
+    px_per_nm = pixels_per_um / 1000.0
+    spacing_px = max(segment_nm * px_per_nm, 1e-6)
+    buckets: dict[int, list[float]] = {}
+    for polymer in polymers:
+        if polymer.excluded_reason:
+            continue
+        sampled = resample_polyline(polymer.points, spacing_px)
+        if sampled.shape[0] < 3:
+            continue
+        for lag in range(1, sampled.shape[0]):
+            deltas = sampled[lag:] - sampled[:-lag]
+            distances_nm2 = (np.sum(deltas * deltas, axis=1) / (px_per_nm * px_per_nm))
+            if distances_nm2.size:
+                buckets.setdefault(lag, []).extend(float(v) for v in distances_nm2)
+    rows: list[dict[str, float]] = []
+    for lag in sorted(buckets):
+        values = np.asarray(buckets[lag], dtype=np.float64)
+        if values.size < 2:
+            continue
+        rows.append(
+            {
+                "contour_separation_nm": lag * segment_nm,
+                "mean_square_end_to_end_nm2": float(values.mean()),
+                "sample_count": float(values.size),
+            }
+        )
+    return rows
+
+
+def detect_polymer_contours(
+    rgb: np.ndarray,
+    pixels_per_um: float,
+    min_length_nm: float,
+    threshold_bias: float = 0.0,
+) -> list[PolymerObject]:
+    scan_minr, scan_minc, scan_maxr, scan_maxc = scan_bbox(rgb)
+    crop_rgb = rgb[scan_minr:scan_maxr, scan_minc:scan_maxc]
+    analysis_scale = min(1.0, POLYMER_ANALYSIS_PIXELS_PER_UM / max(float(pixels_per_um), 1e-9))
+    gray = pil_grayscale_float(crop_rgb, analysis_scale)
+    smooth = filters.gaussian(gray, sigma=max(0.5, analysis_scale))
+    try:
+        threshold = filters.threshold_otsu(smooth)
+    except ValueError:
+        threshold = float(smooth.mean())
+    binary = smooth > min(1.0, threshold + threshold_bias)
+    if binary.mean() > 0.35:
+        binary = smooth < max(0.0, threshold - threshold_bias)
+    binary = remove_small_objects_compat(binary, 24)
+    binary = morphology.closing(binary, morphology.disk(1))
+    skeleton = morphology.skeletonize(binary)
+    labels = measure.label(skeleton)
+    objects: list[PolymerObject] = []
+    min_length_px = min_length_nm * pixels_per_um / 1000.0
+    for prop in measure.regionprops(labels):
+        component_mask = labels[prop.slice] == prop.label
+        path_rc = ordered_skeleton_path(component_mask)
+        reason = ""
+        if path_rc is None:
+            reason = "branched_or_incomplete_skeleton"
+            path_rc = [tuple(map(int, coord)) for coord in np.argwhere(component_mask)]
+        points_xy = [
+            (
+                float((c + prop.bbox[1]) / analysis_scale + scan_minc),
+                float((r + prop.bbox[0]) / analysis_scale + scan_minr),
+            )
+            for r, c in path_rc
+        ]
+        length_px = path_length_px(points_xy)
+        if length_px < min_length_px:
+            reason = "shorter_than_min_length"
+        end_to_end_px = 0.0
+        if len(points_xy) >= 2:
+            first = np.asarray(points_xy[0])
+            last = np.asarray(points_xy[-1])
+            end_to_end_px = float(np.linalg.norm(last - first))
+        objects.append(
+            PolymerObject(
+                object_id=len(objects) + 1,
+                points=points_xy,
+                length_nm=length_px * 1000.0 / pixels_per_um,
+                end_to_end_nm=end_to_end_px * 1000.0 / pixels_per_um,
+                segment_count=max(0, len(points_xy) - 1),
+                excluded_reason=reason,
+            )
+        )
+    return objects
+
+
+def aligned_polymer_contour_points(polymer: PolymerObject, pixels_per_um: float, segment_nm: float) -> np.ndarray:
+    px_per_nm = pixels_per_um / 1000.0
+    spacing_px = max(segment_nm * px_per_nm, 1e-6)
+    sampled_px = resample_polyline(polymer.points, spacing_px)
+    if sampled_px.shape[0] < 2:
+        return np.empty((0, 2), dtype=np.float32)
+    sampled_nm = sampled_px / max(px_per_nm, 1e-9)
+    sampled_nm = sampled_nm - sampled_nm[0]
+    tangent_index = min(3, sampled_nm.shape[0] - 1)
+    tangent = sampled_nm[tangent_index] - sampled_nm[0]
+    angle = math.atan2(float(tangent[1]), float(tangent[0]))
+    cos_a = math.cos(-angle)
+    sin_a = math.sin(-angle)
+    rotation = np.asarray([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float32)
+    aligned = sampled_nm @ rotation.T
+    if aligned[-1, 0] < 0:
+        aligned[:, 0] *= -1
+        aligned[:, 1] *= -1
+    return aligned
+
+
+def polymer_figure_2b_image(
+    rgb: np.ndarray,
+    polymers: list[PolymerObject],
+    pixels_per_um: float,
+    segment_nm: float,
+    title: str = "Polymer contours",
+) -> Image.Image:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    accepted = [polymer for polymer in polymers if not polymer.excluded_reason and len(polymer.points) >= 2]
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 5.0), gridspec_kw={"width_ratios": [1.05, 1.0]})
+
+    ax = axes[0]
+    ax.imshow(rgb)
+    for polymer in accepted:
+        pts = np.asarray(polymer.points, dtype=np.float32)
+        color_rgb = tuple(value / 255.0 for value in polymer_color_rgb(polymer))
+        ax.plot(pts[:, 0], pts[:, 1], color=color_rgb, linewidth=1.4, alpha=0.95)
+    if pixels_per_um > 0:
+        bar_nm = 100.0
+        bar_px = bar_nm * pixels_per_um / 1000.0
+        h, w = rgb.shape[:2]
+        x0 = w * 0.07
+        y0 = h * 0.92
+        ax.plot([x0, x0 + bar_px], [y0, y0], color="white", linewidth=4, solid_capstyle="butt")
+        ax.text(x0, y0 - h * 0.025, "100 nm", color="white", fontsize=9, weight="bold")
+    ax.set_title("AFM + detected contours")
+    ax.set_axis_off()
+
+    ax = axes[1]
+    aligned_sets = [aligned_polymer_contour_points(polymer, pixels_per_um, segment_nm) for polymer in accepted]
+    aligned_sets = [points for points in aligned_sets if points.shape[0] >= 2]
+    for points in aligned_sets:
+        ax.plot(points[:, 0], points[:, 1], color="#777777", linewidth=1.0, alpha=0.55)
+    if aligned_sets:
+        max_x = max(float(points[:, 0].max()) for points in aligned_sets)
+        min_y = min(float(points[:, 1].min()) for points in aligned_sets)
+        max_y = max(float(points[:, 1].max()) for points in aligned_sets)
+        y_margin = max(20.0, (max_y - min_y) * 0.15)
+        ax.set_xlim(-20, max(120.0, max_x + 20.0))
+        ax.set_ylim(max_y + y_margin, min_y - y_margin)
+    ax.axhline(0, color="#dddddd", linewidth=0.8, zorder=0)
+    ax.axvline(0, color="#dddddd", linewidth=0.8, zorder=0)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x after tangent alignment (nm)")
+    ax.set_ylabel("y (nm)")
+    ax.set_title(f"Aligned contours (n={len(aligned_sets)})")
+    ax.grid(alpha=0.18)
+    ax.plot([0, 100], [0, 0], color="#111111", linewidth=3, solid_capstyle="butt")
+    ax.text(0, -12, "100 nm", fontsize=9, va="top")
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return Image.open(buffer).convert("RGB")
+
+
+def polymer_crop_bounds(
+    polymer: PolymerObject,
+    image_shape: tuple[int, int, int],
+    pixels_per_um: float,
+    margin_nm: float = 60.0,
+    side_nm: float | None = None,
+    clip_bbox: tuple[int, int, int, int] | None = None,
+) -> tuple[int, int, int, int]:
+    points = np.asarray(polymer.points, dtype=np.float32)
+    if points.size == 0:
+        return (0, 0, min(1, image_shape[1]), min(1, image_shape[0]))
+    margin_px = margin_nm * pixels_per_um / 1000.0
+    min_x = float(points[:, 0].min() - margin_px)
+    max_x = float(points[:, 0].max() + margin_px)
+    min_y = float(points[:, 1].min() - margin_px)
+    max_y = float(points[:, 1].max() + margin_px)
+    side = max(max_x - min_x, max_y - min_y, 1.0)
+    if side_nm is not None and side_nm > 0 and pixels_per_um > 0:
+        side = max(side, side_nm * pixels_per_um / 1000.0)
+    cx = (min_x + max_x) / 2.0
+    cy = (min_y + max_y) / 2.0
+    h, w = image_shape[:2]
+    if clip_bbox is None:
+        clip_left, clip_top, clip_right, clip_bottom = 0, 0, w, h
+    else:
+        clip_top, clip_left, clip_bottom, clip_right = clip_bbox
+        clip_left = max(0, min(w, int(clip_left)))
+        clip_right = max(clip_left + 1, min(w, int(clip_right)))
+        clip_top = max(0, min(h, int(clip_top)))
+        clip_bottom = max(clip_top + 1, min(h, int(clip_bottom)))
+    left = int(math.floor(cx - side / 2.0))
+    top = int(math.floor(cy - side / 2.0))
+    right = int(math.ceil(cx + side / 2.0))
+    bottom = int(math.ceil(cy + side / 2.0))
+    if left < clip_left:
+        right += clip_left - left
+        left = clip_left
+    if top < clip_top:
+        bottom += clip_top - top
+        top = clip_top
+    if right > clip_right:
+        left = max(clip_left, left - (right - clip_right))
+        right = clip_right
+    if bottom > clip_bottom:
+        top = max(clip_top, top - (bottom - clip_bottom))
+        bottom = clip_bottom
+    return left, top, max(left + 1, right), max(top + 1, bottom)
+
+
+def polymer_figure_c_image(
+    rgb: np.ndarray,
+    polymers: list[PolymerObject],
+    pixels_per_um: float,
+    tile_px: int = 128,
+    pairs_per_row: int = 6,
+    margin_nm: float = 60.0,
+) -> Image.Image:
+    accepted = [polymer for polymer in polymers if not polymer.excluded_reason and len(polymer.points) >= 2]
+    if not accepted:
+        return Image.new("RGB", (420, 180), "white")
+
+    tile = max(72, int(tile_px))
+    pairs_per_row = max(1, min(int(pairs_per_row), max(1, len(accepted))))
+    if len(accepted) <= 20:
+        pairs_per_row = min(pairs_per_row, max(1, int(math.ceil(math.sqrt(len(accepted))))))
+    border = 2
+    outer = 18
+    header = 34
+    overview_gap = 14
+    pair_w = tile * 2 + border
+    pair_h = tile
+    rows = int(math.ceil(len(accepted) / pairs_per_row))
+    last_row_pairs = len(accepted) - (rows - 1) * pairs_per_row
+    max_pairs_in_row = pairs_per_row if rows > 1 else last_row_pairs
+    grid_w = max_pairs_in_row * pair_w + border
+    grid_h = rows * pair_h + border
+    scan_bounds = scan_bbox(rgb)
+    scan_top, scan_left, scan_bottom, scan_right = scan_bounds
+    scan_w = max(1, scan_right - scan_left)
+    scan_h = max(1, scan_bottom - scan_top)
+    overview_h = max(260, int(round((grid_w * scan_h / scan_w) * 1.7)))
+    overview_h = min(max(overview_h, 260), max(260, grid_h))
+    overview_w = max(320, int(round(overview_h * scan_w / scan_h)))
+    overview_x0 = outer
+    grid_x0 = overview_x0 + overview_w + overview_gap
+    content_y0 = outer + header
+    width = outer * 2 + overview_w + overview_gap + grid_w
+    height = outer * 2 + header + max(overview_h, grid_h)
+    canvas = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(canvas)
+    draw.text((outer // 2, outer // 2), "c", fill=(0, 0, 0))
+    crop_side_nm = max(polymer.length_nm + 2.0 * margin_nm for polymer in accepted)
+
+    source = Image.fromarray(rgb).convert("RGB")
+    overview = source.crop((scan_left, scan_top, scan_right, scan_bottom)).resize((overview_w, overview_h), Image.Resampling.LANCZOS).convert("RGBA")
+    overview_layer = Image.new("RGBA", overview.size, (0, 0, 0, 0))
+    overview_draw = ImageDraw.Draw(overview_layer)
+    scale_x = overview_w / scan_w
+    scale_y = overview_h / scan_h
+    contour_width = max(2, min(6, overview_w // 420))
+    for polymer in accepted:
+        label = str(polymer.object_id)
+        points = [((x - scan_left) * scale_x, (y - scan_top) * scale_y) for x, y in polymer.points]
+        red, green, blue = polymer_color_rgb(polymer)
+        overview_draw.line(points, fill=(red, green, blue, 230), width=contour_width)
+        x0, y0 = points[0]
+        badge_w = max(16, 8 + 6 * len(label))
+        overview_draw.rectangle((x0 + 4, y0 + 4, x0 + 4 + badge_w, y0 + 22), fill=(255, 255, 255, 225), outline=(0, 0, 0, 225))
+        overview_draw.text((x0 + 8, y0 + 6), label, fill=(0, 0, 0, 255))
+    overview = Image.alpha_composite(overview, overview_layer).convert("RGB")
+    canvas.paste(overview, (overview_x0, content_y0))
+    draw.rectangle((overview_x0, content_y0, overview_x0 + overview_w, content_y0 + overview_h), outline=(20, 20, 20), width=border)
+    draw.text((overview_x0, content_y0 - 16), "Detected contours", fill=(0, 0, 0))
+
+    for idx, polymer in enumerate(accepted):
+        row = idx // pairs_per_row
+        col = idx % pairs_per_row
+        x0 = grid_x0 + col * pair_w
+        y0 = content_y0 + row * pair_h
+        label = str(polymer.object_id)
+        left, top, right, bottom = polymer_crop_bounds(polymer, rgb.shape, pixels_per_um, margin_nm, crop_side_nm, scan_bounds)
+        crop = source.crop((left, top, right, bottom)).resize((tile, tile), Image.Resampling.LANCZOS)
+        crop_draw = ImageDraw.Draw(crop)
+        badge_w = max(16, 8 + 6 * len(label))
+        crop_draw.rectangle((4, 4, 4 + badge_w, 22), fill=(255, 255, 255), outline=(0, 0, 0))
+        crop_draw.text((8, 6), label, fill=(0, 0, 0))
+        canvas.paste(crop, (x0, y0))
+
+        contour_tile = Image.new("RGB", (tile, tile), "white")
+        contour_draw = ImageDraw.Draw(contour_tile)
+        crop_w = max(1, right - left)
+        crop_h = max(1, bottom - top)
+        contour_points = [((x - left) * tile / crop_w, (y - top) * tile / crop_h) for x, y in polymer.points]
+        contour_draw.line(contour_points, fill=(0, 0, 0), width=max(1, tile // 55))
+        contour_draw.text((8, 6), label, fill=(0, 0, 0))
+        canvas.paste(contour_tile, (x0 + tile, y0))
+
+    for idx in range(len(accepted)):
+        row = idx // pairs_per_row
+        col = idx % pairs_per_row
+        x0 = grid_x0 + col * pair_w
+        y0 = content_y0 + row * pair_h
+        draw.rectangle((x0, y0, x0 + pair_w, y0 + pair_h), outline=(20, 20, 20), width=border)
+        draw.line((x0 + tile, y0, x0 + tile, y0 + pair_h), fill=(20, 20, 20), width=border)
+
+    if pixels_per_um > 0:
+        bar_nm = 300.0
+        crop_scale_px_per_nm = tile / max(1.0, crop_side_nm)
+        bar_px = int(round(bar_nm * crop_scale_px_per_nm))
+        bar_px = min(max(24, bar_px), max(28, tile))
+        bx2 = width - outer
+        bx1 = bx2 - bar_px
+        by = outer + 8
+        draw.line((bx1, by, bx2, by), fill=(0, 0, 0), width=4)
+        draw.text((bx1, max(0, by - 16)), "300nm", fill=(0, 0, 0))
+
+    return canvas
+
+
 class OrigamiCounterApp:
     def __init__(self, root: Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry("1360x850")
 
-        self.workspace = Path.cwd()
+        self.workspace = Path.home()
         self.output_dir = self.workspace / OUTPUT_DIR
-        self.output_dir.mkdir(exist_ok=True)
         self.labels_path = self.output_dir / LABELS_FILE
         self.model_path = self.output_dir / MODEL_FILE
 
@@ -547,6 +1085,11 @@ class OrigamiCounterApp:
         self.current_image: Path | None = None
         self.rgb: np.ndarray | None = None
         self.objects: list[OrigamiObject] = []
+        self.polymer_objects: list[PolymerObject] = []
+        self.polymer_persistence_nm: float | None = None
+        self.polymer_fit_r2: float | None = None
+        self.polymer_msd_rows: list[dict[str, float]] = []
+        self.polymer_analysis_cache: dict[str, PolymerAnalysisResult] = {}
         self.labels: dict[str, dict[str, str]] = {}
         self.training_labels: dict[str, dict[str, str]] = {}
         self.scale_calibrations: dict[str, dict[str, float]] = {}
@@ -564,10 +1107,20 @@ class OrigamiCounterApp:
         self.drag_start: tuple[int, int] | None = None
         self.drag_preview_id: int | None = None
         self.pan_start: tuple[int, int] | None = None
+        self.syncing_image_selection = False
 
         self.min_area = StringVar(value="30")
         self.max_area = StringVar(value="2000")
+        self.target_size_nm = StringVar(value="")
+        self.size_range_factor = StringVar(value="0.35-3.0")
         self.threshold_bias = StringVar(value="0.00")
+        self.polymer_min_length_nm = StringVar(value="80")
+        self.polymer_segment_nm = StringVar(value="20")
+        self.polymer_preview_mode = StringVar(value="Overlay")
+        self.polymer_overlay_opacity = StringVar(value="0.55")
+        self.polymer_progress_text = StringVar(value="")
+        self.polymer_status = StringVar(value="")
+        self.polymer_view_mode = "analysis"
         self.status = StringVar(value="Open a root folder to begin.")
         self.counts_text = StringVar(value="")
         self.training_status = StringVar(value="")
@@ -588,15 +1141,22 @@ class OrigamiCounterApp:
         self.analysis_scale_filter: set[str] | None = None
         self.analysis_origami_filter: set[str] | None = None
         self.analysis_dataset_filter: set[str] | None = None
+        self.analysis_image_filter: set[str] | None = None
         self.analysis_state_filter: set[str] | None = None
         self.analysis_scale_options: list[str] = []
         self.analysis_origami_options: list[str] = []
         self.analysis_dataset_options: list[str] = []
+        self.analysis_image_options: list[str] = []
         self.analysis_state_options: list[str] = []
         self.analysis_filter_status = StringVar(value="Filters: all")
         self.analysis_csv_path: Path | None = None
         self.plot_previews: dict[str, Image.Image] = {}
         self.plot_preview_photo: ImageTk.PhotoImage | None = None
+        self.polymer_preview_photo: ImageTk.PhotoImage | None = None
+        self.polymer_plot_photo: ImageTk.PhotoImage | None = None
+        self.polymer_figure_2b_photo: ImageTk.PhotoImage | None = None
+        self.polymer_figure_c_photo: ImageTk.PhotoImage | None = None
+        self.spm_import_preview_photo: ImageTk.PhotoImage | None = None
         self.analysis_image_photo: ImageTk.PhotoImage | None = None
         self.analysis_review_photo: ImageTk.PhotoImage | None = None
         self.analysis_review_rows: list[dict[str, str]] = []
@@ -605,13 +1165,13 @@ class OrigamiCounterApp:
         self.analysis_review_zoom = 1.0
         self.analysis_review_fit_to_window = True
         self.plot_preview_zoom = 1.0
+        self.plot_preview_fit_to_window = True
         self.current_plot_preview_name: str | None = None
         self.plot_preview_canvas_image_id: int | None = None
         self.min_area_um2: float | None = None
         self.max_area_um2: float | None = None
 
         self.build_ui()
-        self.open_root(self.workspace)
 
     def build_ui(self) -> None:
         menubar = Menu(self.root)
@@ -629,8 +1189,10 @@ class OrigamiCounterApp:
         notebook.pack(fill=BOTH, expand=True)
         classify_tab = Frame(notebook)
         analysis_tab = Frame(notebook)
+        polymers_tab = Frame(notebook)
         notebook.add(classify_tab, text="Classify")
         notebook.add(analysis_tab, text="Analysis")
+        notebook.add(polymers_tab, text="Polymers")
 
         main = Frame(classify_tab)
         main.pack(fill=BOTH, expand=True)
@@ -653,8 +1215,6 @@ class OrigamiCounterApp:
 
         Button(sidebar, text="Open Root", command=self.choose_root).pack(fill="x")
         Button(sidebar, text="Import SPM Folder", command=self.import_spm_folder).pack(fill="x", pady=(4, 0))
-        Button(sidebar, text="Load Classifier", command=self.load_classifier_from_file).pack(fill="x", pady=(4, 0))
-        Button(sidebar, text="Export Classifier", command=self.export_classifier).pack(fill="x", pady=(4, 0))
         Button(sidebar, text="Plot Counts CSV", command=self.plot_counts_csv).pack(fill="x", pady=(4, 0))
         Label(sidebar, text="Images").pack(anchor="w", pady=(10, 2))
         image_list_frame = Frame(sidebar)
@@ -687,12 +1247,16 @@ class OrigamiCounterApp:
         params.pack(fill="x", pady=8)
         self.add_labeled_entry(params, "Scale bar um", self.scale_bar_um)
         Label(params, textvariable=self.scale_status, justify=LEFT).pack(fill="x", padx=6, pady=(0, 4))
-        self.add_labeled_entry(params, "Min area", self.min_area)
-        self.add_labeled_entry(params, "Max area", self.max_area)
+        self.min_area_entry = self.add_labeled_entry(params, "Min pixel area", self.min_area)
+        self.max_area_entry = self.add_labeled_entry(params, "Max pixel area", self.max_area)
+        self.target_size_entry = self.add_labeled_entry(params, "Target size nm", self.target_size_nm)
+        self.size_range_entry = self.add_labeled_entry(params, "Size range multiple", self.size_range_factor)
+        self.bind_detection_size_sync()
         self.add_labeled_entry(params, "Threshold bias", self.threshold_bias)
         Button(params, text="Box Scale", command=self.start_scale_box).pack(fill="x", padx=6, pady=(4, 0))
-        Button(params, text="Box Area", command=self.start_area_box).pack(fill="x", padx=6, pady=(4, 0))
+        Button(params, text="Box Pixel Area", command=self.start_area_box).pack(fill="x", padx=6, pady=(4, 0))
         Button(params, text="Detect", command=self.detect_current).pack(fill="x", padx=6, pady=4)
+        Button(params, text="Detect + Export All Images", command=self.detect_all_images).pack(fill="x", padx=6, pady=(0, 4))
 
         state_box = ttk.LabelFrame(sidebar, text="States")
         state_box.pack(fill="x", pady=8)
@@ -710,6 +1274,8 @@ class OrigamiCounterApp:
         Button(train_box, text="Add Current Image Labels to Training Data", command=self.add_current_labels_to_training).pack(fill="x", padx=6, pady=(4, 2))
         Button(train_box, text="Train Current Image", command=self.train_current_image_model).pack(fill="x", padx=6, pady=2)
         Button(train_box, text="Train All Labeled Images", command=self.train_model).pack(fill="x", padx=6, pady=(2, 4))
+        Button(train_box, text="Load Classifier", command=self.load_classifier_from_file).pack(fill="x", padx=6, pady=2)
+        Button(train_box, text="Export Classifier", command=self.export_classifier).pack(fill="x", padx=6, pady=(2, 4))
         self.training_progress = ttk.Progressbar(train_box, mode="indeterminate")
         self.training_progress.pack(fill="x", padx=6, pady=(0, 4))
         Label(train_box, textvariable=self.training_status, justify=LEFT).pack(fill="x", padx=6)
@@ -752,22 +1318,238 @@ class OrigamiCounterApp:
         self.canvas.bind("<Configure>", self.on_canvas_configure)
 
         self.build_analysis_tab(analysis_tab)
+        self.build_polymers_tab(polymers_tab)
 
-    def add_labeled_entry(self, parent: Frame, label: str, var: StringVar) -> None:
+    def build_polymers_tab(self, parent: Frame) -> None:
+        main = Frame(parent)
+        main.pack(fill=BOTH, expand=True)
+
+        sidebar = Frame(main, width=330)
+        sidebar.pack(side=LEFT, fill="y", padx=8, pady=8)
+        sidebar.pack_propagate(False)
+
+        Button(sidebar, text="Open Root", command=self.choose_root).pack(fill="x")
+        Button(sidebar, text="Import SPM Folder", command=self.import_spm_folder).pack(fill="x", pady=(4, 0))
+        Label(sidebar, text="Images").pack(anchor="w", pady=(10, 2))
+        image_list_frame = Frame(sidebar)
+        image_list_frame.pack(fill="x")
+        self.polymer_image_list = Listbox(image_list_frame, height=12, exportselection=False)
+        polymer_image_scroll = Scrollbar(image_list_frame, orient="vertical", command=self.polymer_image_list.yview)
+        self.polymer_image_list.configure(yscrollcommand=polymer_image_scroll.set)
+        self.polymer_image_list.pack(side=LEFT, fill="x", expand=True)
+        polymer_image_scroll.pack(side=RIGHT, fill="y")
+        self.polymer_image_list.bind("<<ListboxSelect>>", self.on_polymer_image_select)
+        self.polymer_image_list.bind("<MouseWheel>", self.on_polymer_image_list_mousewheel)
+
+        settings = ttk.LabelFrame(sidebar, text="Contour Analysis")
+        settings.pack(fill="x", pady=8)
+        self.add_labeled_entry(settings, "Min length nm", self.polymer_min_length_nm)
+        self.add_labeled_entry(settings, "Segment nm", self.polymer_segment_nm)
+        self.add_labeled_entry(settings, "Threshold bias", self.threshold_bias)
+        preview_row = Frame(settings)
+        preview_row.pack(fill="x", padx=6, pady=3)
+        Label(preview_row, text="Preview", width=19, anchor="w").pack(side=LEFT)
+        self.polymer_preview_combo = ttk.Combobox(
+            preview_row,
+            textvariable=self.polymer_preview_mode,
+            values=["Original", "Overlay", "Contours"],
+            state="readonly",
+            width=10,
+        )
+        self.polymer_preview_combo.pack(side=RIGHT)
+        self.polymer_preview_combo.bind("<<ComboboxSelected>>", lambda _event: self.render_polymer_preview())
+        self.polymer_opacity_entry = self.add_labeled_entry(settings, "Overlay opacity", self.polymer_overlay_opacity)
+        self.polymer_opacity_entry.bind("<Return>", lambda _event: self.render_polymer_preview())
+        self.polymer_opacity_entry.bind("<FocusOut>", lambda _event: self.render_polymer_preview())
+        Button(settings, text="Analyze Polymers", command=self.analyze_current_polymers).pack(fill="x", padx=6, pady=(4, 0))
+        self.polymer_progress = ttk.Progressbar(settings, mode="determinate", maximum=100)
+        self.polymer_progress.pack(fill="x", padx=6, pady=(4, 0))
+        Label(settings, textvariable=self.polymer_progress_text, justify=LEFT, wraplength=285).pack(fill="x", padx=6, pady=(2, 4))
+        Button(settings, text="Show Contours + Fit", command=self.show_polymer_analysis_view).pack(fill="x", padx=6, pady=(4, 0))
+        Button(settings, text="Preview Figure 2b Plot", command=self.preview_current_polymer_figure_2b).pack(fill="x", padx=6, pady=(4, 0))
+        Button(settings, text="Export Figure 2b Plot", command=self.export_current_polymer_figure_2b).pack(fill="x", padx=6, pady=(4, 0))
+        Button(settings, text="Preview Figure C Plot", command=self.preview_current_polymer_figure_c).pack(fill="x", padx=6, pady=(4, 0))
+        Button(settings, text="Export Figure C Plot", command=self.export_current_polymer_figure_c).pack(fill="x", padx=6, pady=(4, 0))
+        Button(settings, text="Export Polymer Results", command=self.export_current_polymer_results).pack(fill="x", padx=6, pady=4)
+        Label(settings, textvariable=self.scale_status, justify=LEFT, wraplength=285).pack(fill="x", padx=6, pady=(0, 4))
+        Label(settings, textvariable=self.polymer_status, justify=LEFT, wraplength=285).pack(fill="x", padx=6, pady=(0, 6))
+
+        method = ttk.LabelFrame(sidebar, text="Fit")
+        method.pack(fill="x", pady=8)
+        Label(
+            method,
+            text="<R^2> = 4 Lp lc [1 - (2 Lp/lc)(1 - exp(-lc/(2 Lp)))]",
+            justify=LEFT,
+            wraplength=285,
+        ).pack(fill="x", padx=6, pady=6)
+
+        panes = ttk.Panedwindow(main, orient="vertical")
+        self.polymer_panes = panes
+        panes.pack(side=RIGHT, fill=BOTH, expand=True, padx=(0, 8), pady=8)
+
+        image_box = ttk.LabelFrame(panes, text="Detected Contours")
+        self.polymer_image_box = image_box
+        panes.add(image_box, weight=3)
+        image_frame = Frame(image_box)
+        image_frame.pack(fill=BOTH, expand=True, padx=6, pady=6)
+        self.polymer_canvas = Canvas(image_frame, background="#202124", highlightthickness=0)
+        polymer_y_scroll = Scrollbar(image_frame, orient="vertical", command=self.polymer_canvas.yview)
+        polymer_x_scroll = Scrollbar(image_frame, orient="horizontal", command=self.polymer_canvas.xview)
+        self.polymer_canvas.configure(xscrollcommand=polymer_x_scroll.set, yscrollcommand=polymer_y_scroll.set)
+        self.polymer_canvas.grid(row=0, column=0, sticky="nsew")
+        polymer_y_scroll.grid(row=0, column=1, sticky="ns")
+        polymer_x_scroll.grid(row=1, column=0, sticky="ew")
+        image_frame.rowconfigure(0, weight=1)
+        image_frame.columnconfigure(0, weight=1)
+        self.polymer_canvas.bind("<Configure>", lambda _event: self.render_polymer_preview())
+
+        plot_box = ttk.LabelFrame(panes, text="Persistence Length Fit")
+        self.polymer_plot_box = plot_box
+        panes.add(plot_box, weight=2)
+        plot_frame = Frame(plot_box)
+        plot_frame.pack(fill=BOTH, expand=True, padx=6, pady=6)
+        self.polymer_plot_canvas = Canvas(plot_frame, background="#f0f0f0", highlightthickness=0)
+        plot_y_scroll = Scrollbar(plot_frame, orient="vertical", command=self.polymer_plot_canvas.yview)
+        plot_x_scroll = Scrollbar(plot_frame, orient="horizontal", command=self.polymer_plot_canvas.xview)
+        self.polymer_plot_canvas.configure(xscrollcommand=plot_x_scroll.set, yscrollcommand=plot_y_scroll.set)
+        self.polymer_plot_canvas.grid(row=0, column=0, sticky="nsew")
+        plot_y_scroll.grid(row=0, column=1, sticky="ns")
+        plot_x_scroll.grid(row=1, column=0, sticky="ew")
+        plot_frame.rowconfigure(0, weight=1)
+        plot_frame.columnconfigure(0, weight=1)
+        self.polymer_plot_canvas.create_text(16, 16, text="Run Analyze Polymers to generate the WLC fit plot.", anchor="nw")
+        self.polymer_plot_canvas.bind("<Configure>", lambda _event: self.render_polymer_fit_plot())
+
+        figure_box = ttk.LabelFrame(panes, text="Figure 2b-Style Contour Plot")
+        self.polymer_figure_2b_box = figure_box
+        figure_frame = Frame(figure_box)
+        figure_frame.pack(fill=BOTH, expand=True, padx=6, pady=6)
+        self.polymer_figure_2b_canvas = Canvas(figure_frame, background="#f0f0f0", highlightthickness=0)
+        figure_y_scroll = Scrollbar(figure_frame, orient="vertical", command=self.polymer_figure_2b_canvas.yview)
+        figure_x_scroll = Scrollbar(figure_frame, orient="horizontal", command=self.polymer_figure_2b_canvas.xview)
+        self.polymer_figure_2b_canvas.configure(xscrollcommand=figure_x_scroll.set, yscrollcommand=figure_y_scroll.set)
+        self.polymer_figure_2b_canvas.grid(row=0, column=0, sticky="nsew")
+        figure_y_scroll.grid(row=0, column=1, sticky="ns")
+        figure_x_scroll.grid(row=1, column=0, sticky="ew")
+        figure_frame.rowconfigure(0, weight=1)
+        figure_frame.columnconfigure(0, weight=1)
+        self.polymer_figure_2b_canvas.create_text(16, 16, text="Run Preview Figure 2b Plot to view aligned contours here.", anchor="nw")
+        self.polymer_figure_2b_canvas.bind("<Configure>", lambda _event: self.render_polymer_figure_2b_preview())
+
+        figure_c_box = ttk.LabelFrame(panes, text="Figure C-Style Crop + Contour Plot")
+        self.polymer_figure_c_box = figure_c_box
+        figure_c_frame = Frame(figure_c_box)
+        figure_c_frame.pack(fill=BOTH, expand=True, padx=6, pady=6)
+        self.polymer_figure_c_canvas = Canvas(figure_c_frame, background="#f0f0f0", highlightthickness=0)
+        figure_c_y_scroll = Scrollbar(figure_c_frame, orient="vertical", command=self.polymer_figure_c_canvas.yview)
+        figure_c_x_scroll = Scrollbar(figure_c_frame, orient="horizontal", command=self.polymer_figure_c_canvas.xview)
+        self.polymer_figure_c_canvas.configure(xscrollcommand=figure_c_x_scroll.set, yscrollcommand=figure_c_y_scroll.set)
+        self.polymer_figure_c_canvas.grid(row=0, column=0, sticky="nsew")
+        figure_c_y_scroll.grid(row=0, column=1, sticky="ns")
+        figure_c_x_scroll.grid(row=1, column=0, sticky="ew")
+        figure_c_frame.rowconfigure(0, weight=1)
+        figure_c_frame.columnconfigure(0, weight=1)
+        self.polymer_figure_c_canvas.create_text(16, 16, text="Run Preview Figure C Plot to view crop/contour pairs here.", anchor="nw")
+        self.polymer_figure_c_canvas.bind("<Configure>", lambda _event: self.render_polymer_figure_c_preview())
+
+    def add_labeled_entry(self, parent: Frame, label: str, var: StringVar) -> Entry:
         row = Frame(parent)
         row.pack(fill="x", padx=6, pady=3)
-        Label(row, text=label, width=14, anchor="w").pack(side=LEFT)
-        Entry(row, textvariable=var, width=10).pack(side=RIGHT)
+        Label(row, text=label, width=19, anchor="w").pack(side=LEFT)
+        entry = Entry(row, textvariable=var, width=10)
+        entry.pack(side=RIGHT)
+        return entry
+
+    def set_polymer_view(self, mode: str) -> None:
+        panes = getattr(self, "polymer_panes", None)
+        if panes is None:
+            return
+        if mode not in {"analysis", "figure_2b", "figure_c"}:
+            mode = "analysis"
+        self.polymer_view_mode = mode
+        boxes = [
+            getattr(self, "polymer_image_box", None),
+            getattr(self, "polymer_plot_box", None),
+            getattr(self, "polymer_figure_2b_box", None),
+            getattr(self, "polymer_figure_c_box", None),
+        ]
+        for box in boxes:
+            if box is None:
+                continue
+            try:
+                panes.forget(box)
+            except Exception:
+                pass
+        if mode == "figure_2b":
+            panes.add(self.polymer_figure_2b_box, weight=1)
+            self.render_polymer_figure_2b_preview()
+        elif mode == "figure_c":
+            panes.add(self.polymer_figure_c_box, weight=1)
+            self.render_polymer_figure_c_preview()
+        else:
+            panes.add(self.polymer_image_box, weight=3)
+            panes.add(self.polymer_plot_box, weight=2)
+            self.render_polymer_preview()
+            self.render_polymer_fit_plot()
+        self.root.update_idletasks()
+
+    def show_polymer_analysis_view(self) -> None:
+        self.set_polymer_view("analysis")
+
+    def bind_detection_size_sync(self) -> None:
+        for entry in (self.target_size_entry, self.size_range_entry):
+            entry.bind("<Return>", self.sync_pixel_area_from_target_size)
+            entry.bind("<FocusOut>", self.sync_pixel_area_from_target_size)
+        for entry in (self.min_area_entry, self.max_area_entry):
+            entry.bind("<Return>", self.sync_target_size_from_pixel_area)
+            entry.bind("<FocusOut>", self.sync_target_size_from_pixel_area)
+
+    def sync_pixel_area_from_target_size(self, _event=None) -> None:
+        if not self.target_size_nm.get().strip():
+            return
+        try:
+            scale_info = self.current_scale_info(self.rgb, self.current_image)
+            min_area, max_area = self.detection_area_bounds(
+                scale_info,
+                float(self.min_area.get()),
+                float(self.max_area.get()),
+                use_physical_area=False,
+                target_size_nm=self.target_size_nm.get(),
+                size_range_factor=self.size_range_factor.get(),
+            )
+        except Exception as exc:
+            self.status.set(f"Could not convert target size to pixel area: {exc}")
+            return
+        self.min_area.set(str(min_area))
+        self.max_area.set(str(max_area))
+        self.status.set(f"Updated pixel area limits from target size using {scale_info.pixels_per_um:.1f} px/um.")
+
+    def sync_target_size_from_pixel_area(self, _event=None) -> None:
+        try:
+            min_area_px = float(self.min_area.get())
+            max_area_px = float(self.max_area.get())
+            if min_area_px <= 0 or max_area_px <= 0:
+                raise ValueError("pixel area limits must be positive")
+            scale_info = self.current_scale_info(self.rgb, self.current_image)
+            low_factor, high_factor = self.parse_size_range_factors(self.size_range_factor.get())
+            pixels_per_um2 = scale_info.pixels_per_um * scale_info.pixels_per_um
+            min_area_um2 = min_area_px / pixels_per_um2
+            max_area_um2 = max_area_px / pixels_per_um2
+            target_area_um2 = ((min_area_um2 / low_factor) + (max_area_um2 / high_factor)) / 2.0
+            side_nm = math.sqrt(max(target_area_um2, 1e-12) * 1_000_000.0)
+        except Exception as exc:
+            self.status.set(f"Could not convert pixel area to target size: {exc}")
+            return
+        side_text = f"{side_nm:.1f}".rstrip("0").rstrip(".")
+        self.target_size_nm.set(f"{side_text}x{side_text}")
+        self.status.set(f"Updated target size as square-equivalent size using {scale_info.pixels_per_um:.1f} px/um.")
 
     def build_analysis_tab(self, parent: Frame) -> None:
         toolbar = Frame(parent)
         toolbar.pack(fill="x", padx=8, pady=8)
-        Button(toolbar, text="Load all_images Folder", command=self.load_analysis_folder).pack(side=LEFT)
+        Button(toolbar, text="Load Folder", command=self.load_analysis_folder).pack(side=LEFT)
         Button(toolbar, text="Load 2 Folders", command=self.load_analysis_comparison_folders).pack(side=LEFT, padx=(6, 0))
-        Button(toolbar, text="Generate Plot Previews", command=self.generate_analysis_plot_previews).pack(side=LEFT, padx=6)
-        Button(toolbar, text="Save Selected Plot", command=self.save_selected_plot_preview).pack(side=LEFT)
-        Button(toolbar, text="Save All Plots", command=self.save_all_plot_previews).pack(side=LEFT, padx=6)
-        Button(toolbar, text="Save Cleaned Dataset", command=self.save_cleaned_analysis_dataset).pack(side=LEFT)
+        Button(toolbar, text="Save Cleaned Dataset", command=self.save_cleaned_analysis_dataset).pack(side=LEFT, padx=6)
         Label(toolbar, textvariable=self.analysis_status).pack(side=LEFT, padx=12)
 
         summary_box = ttk.LabelFrame(parent, text="Summary")
@@ -787,65 +1569,28 @@ class OrigamiCounterApp:
 
         plot_box = ttk.LabelFrame(analysis_panes, text="Plot Preview")
         analysis_panes.add(plot_box, weight=2)
-        plot_toolbar = Frame(plot_box)
-        plot_toolbar.pack(fill="x", padx=6, pady=(6, 0))
-        plot_toolbar_top = Frame(plot_toolbar)
-        plot_toolbar_top.pack(fill="x")
-        plot_toolbar_bottom = Frame(plot_toolbar)
-        plot_toolbar_bottom.pack(fill="x", pady=(4, 0))
-        Button(plot_toolbar_top, text="Zoom Out", command=lambda: self.adjust_plot_preview_zoom(0.8)).pack(side=LEFT)
-        Button(plot_toolbar_top, text="Reset", command=self.reset_plot_preview_zoom).pack(side=LEFT, padx=6)
-        Button(plot_toolbar_top, text="Zoom In", command=lambda: self.adjust_plot_preview_zoom(1.25)).pack(side=LEFT)
-        self.plot_zoom_status = StringVar(value="100%")
-        Label(plot_toolbar_top, textvariable=self.plot_zoom_status).pack(side=LEFT, padx=10)
-        Label(plot_toolbar_top, text="Group").pack(side=LEFT, padx=(16, 4))
-        self.analysis_group_combo = ttk.Combobox(
-            plot_toolbar_top,
-            textvariable=self.analysis_plot_group,
-            values=["Images", "Dataset", "Origami", "Scale", "Origami + Scale", "Dataset + Origami", "Dataset + Scale", "Dataset + Origami + Scale"],
-            width=14,
-            state="readonly",
-        )
-        self.analysis_group_combo.pack(side=LEFT)
-        self.analysis_group_combo.bind("<<ComboboxSelected>>", self.on_analysis_plot_group_select)
-        Label(plot_toolbar_top, text="X Order").pack(side=LEFT, padx=(10, 4))
-        self.analysis_x_order_combo = ttk.Combobox(
-            plot_toolbar_top,
-            textvariable=self.analysis_x_axis_order,
-            values=["Origami first", "Dataset first"],
-            width=12,
-            state="readonly",
-        )
-        self.analysis_x_order_combo.pack(side=LEFT)
-        self.analysis_x_order_combo.bind("<<ComboboxSelected>>", self.on_analysis_plot_order_select)
-        Button(plot_toolbar_top, text="Filter Datasets", command=self.choose_analysis_dataset_filter).pack(side=LEFT, padx=(10, 0))
-        Button(plot_toolbar_top, text="Filter Scales", command=self.choose_analysis_scale_filter).pack(side=LEFT, padx=(10, 0))
-        Button(plot_toolbar_top, text="Filter Origami", command=self.choose_analysis_origami_filter).pack(side=LEFT, padx=(6, 0))
-        Button(plot_toolbar_top, text="Filter States", command=self.choose_analysis_state_filter).pack(side=LEFT, padx=(6, 0))
-        Button(plot_toolbar_top, text="Clear Filters", command=self.clear_analysis_plot_filters).pack(side=LEFT, padx=(6, 0))
-        Label(plot_toolbar_bottom, text="Scatter X").pack(side=LEFT)
-        self.analysis_x_combo = ttk.Combobox(plot_toolbar_bottom, textvariable=self.analysis_x_state, values=[], width=10, state="readonly")
-        self.analysis_x_combo.pack(side=LEFT)
-        self.analysis_x_combo.bind("<<ComboboxSelected>>", self.on_analysis_scatter_select)
-        Label(plot_toolbar_bottom, text="Y").pack(side=LEFT, padx=(8, 4))
-        self.analysis_y_combo = ttk.Combobox(plot_toolbar_bottom, textvariable=self.analysis_y_state, values=[], width=10, state="readonly")
-        self.analysis_y_combo.pack(side=LEFT)
-        self.analysis_y_combo.bind("<<ComboboxSelected>>", self.on_analysis_scatter_select)
-        Label(plot_toolbar_bottom, text="Delta State").pack(side=LEFT, padx=(10, 4))
-        self.analysis_delta_combo = ttk.Combobox(plot_toolbar_bottom, textvariable=self.analysis_delta_state, values=[], width=10, state="readonly")
-        self.analysis_delta_combo.pack(side=LEFT)
-        self.analysis_delta_combo.bind("<<ComboboxSelected>>", self.on_analysis_delta_state_select)
-        Button(plot_toolbar_bottom, text="Rename States", command=self.rename_analysis_state_labels).pack(side=LEFT, padx=8)
-        Button(plot_toolbar_bottom, text="Update Scatter", command=self.generate_analysis_plot_previews).pack(side=LEFT, padx=8)
-        Button(plot_toolbar_bottom, text="Overlay Datasets", command=self.generate_dataset_overlay_plot_preview).pack(side=LEFT)
-        Label(plot_toolbar_bottom, textvariable=self.analysis_filter_status).pack(side=LEFT, padx=(8, 0))
-
         plot_inner = Frame(plot_box)
         plot_inner.pack(fill=BOTH, expand=True, padx=6, pady=6)
-        self.plot_list = Listbox(plot_inner, height=6, exportselection=False)
+
+        plot_left = Frame(plot_inner)
+        plot_left.pack(side=LEFT, fill=BOTH, expand=True)
+        plot_actions = Frame(plot_left)
+        plot_actions.pack(fill="x", pady=(0, 6))
+        Button(plot_actions, text="Generate Plot Previews", command=self.generate_analysis_plot_previews).pack(side=LEFT)
+        Button(plot_actions, text="Save Selected Plot", command=self.save_selected_plot_preview).pack(side=LEFT, padx=6)
+        Button(plot_actions, text="Save All Plots", command=self.save_all_plot_previews).pack(side=LEFT)
+        Button(plot_actions, text="Zoom Out", command=lambda: self.adjust_plot_preview_zoom(0.8)).pack(side=LEFT, padx=(16, 0))
+        Button(plot_actions, text="Reset", command=self.reset_plot_preview_zoom).pack(side=LEFT, padx=6)
+        Button(plot_actions, text="Zoom In", command=lambda: self.adjust_plot_preview_zoom(1.25)).pack(side=LEFT)
+        self.plot_zoom_status = StringVar(value="100%")
+        Label(plot_actions, textvariable=self.plot_zoom_status).pack(side=LEFT, padx=10)
+
+        plot_body = Frame(plot_left)
+        plot_body.pack(fill=BOTH, expand=True)
+        self.plot_list = Listbox(plot_body, height=6, exportselection=False)
         self.plot_list.pack(side=LEFT, fill="y")
         self.plot_list.bind("<<ListboxSelect>>", self.on_plot_preview_select)
-        preview_frame = Frame(plot_inner)
+        preview_frame = Frame(plot_body)
         preview_frame.pack(side=LEFT, fill=BOTH, expand=True, padx=(8, 0))
         self.plot_preview_canvas = Canvas(preview_frame, background="#f0f0f0", highlightthickness=0)
         plot_y_scroll = Scrollbar(preview_frame, orient="vertical", command=self.plot_preview_canvas.yview)
@@ -858,6 +1603,69 @@ class OrigamiCounterApp:
         preview_frame.columnconfigure(0, weight=1)
         self.plot_preview_canvas.create_text(16, 16, text="Generate plot previews to view them here.", anchor="nw")
         self.plot_preview_canvas.bind("<Configure>", lambda _event: self.render_plot_preview())
+
+        settings_panel = ttk.LabelFrame(plot_inner, text="Plot Settings", width=260)
+        settings_panel.pack(side=RIGHT, fill="y", padx=(8, 0))
+        settings_panel.pack_propagate(False)
+        settings_canvas = Canvas(settings_panel, highlightthickness=0)
+        self.plot_settings_canvas = settings_canvas
+        settings_scroll = Scrollbar(settings_panel, orient="vertical", command=settings_canvas.yview)
+        settings_canvas.configure(yscrollcommand=settings_scroll.set)
+        settings_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        settings_scroll.pack(side=RIGHT, fill="y")
+        settings_body = Frame(settings_canvas)
+        settings_window = settings_canvas.create_window((0, 0), window=settings_body, anchor="nw")
+        settings_body.bind("<Configure>", lambda _event: settings_canvas.configure(scrollregion=settings_canvas.bbox("all")))
+        settings_canvas.bind("<Configure>", lambda event: settings_canvas.itemconfigure(settings_window, width=event.width))
+
+        Label(settings_body, text="Group", anchor="w").pack(fill="x", padx=8, pady=(8, 2))
+        self.analysis_group_combo = ttk.Combobox(
+            settings_body,
+            textvariable=self.analysis_plot_group,
+            values=["Images", "Dataset", "Origami", "Scale", "Origami + Scale", "Dataset + Origami", "Dataset + Scale", "Dataset + Origami + Scale"],
+            state="readonly",
+        )
+        self.analysis_group_combo.pack(fill="x", padx=8)
+        self.analysis_group_combo.bind("<<ComboboxSelected>>", self.on_analysis_plot_group_select)
+
+        Label(settings_body, text="X Order", anchor="w").pack(fill="x", padx=8, pady=(10, 2))
+        self.analysis_x_order_combo = ttk.Combobox(
+            settings_body,
+            textvariable=self.analysis_x_axis_order,
+            values=["Origami first", "Dataset first"],
+            state="readonly",
+        )
+        self.analysis_x_order_combo.pack(fill="x", padx=8)
+        self.analysis_x_order_combo.bind("<<ComboboxSelected>>", self.on_analysis_plot_order_select)
+
+        filter_box = ttk.LabelFrame(settings_body, text="Filters")
+        filter_box.pack(fill="x", padx=8, pady=10)
+        Button(filter_box, text="Datasets", command=self.choose_analysis_dataset_filter).pack(fill="x", padx=6, pady=(6, 2))
+        Button(filter_box, text="Images", command=self.choose_analysis_image_filter).pack(fill="x", padx=6, pady=2)
+        Button(filter_box, text="Scales", command=self.choose_analysis_scale_filter).pack(fill="x", padx=6, pady=2)
+        Button(filter_box, text="Origami", command=self.choose_analysis_origami_filter).pack(fill="x", padx=6, pady=2)
+        Button(filter_box, text="States", command=self.choose_analysis_state_filter).pack(fill="x", padx=6, pady=2)
+        Button(filter_box, text="Clear Filters", command=self.clear_analysis_plot_filters).pack(fill="x", padx=6, pady=(2, 6))
+        Label(filter_box, textvariable=self.analysis_filter_status, justify=LEFT, wraplength=210).pack(fill="x", padx=6, pady=(0, 6))
+
+        scatter_box = ttk.LabelFrame(settings_body, text="Scatter / Delta")
+        scatter_box.pack(fill="x", padx=8, pady=(0, 10))
+        Label(scatter_box, text="Scatter X", anchor="w").pack(fill="x", padx=6, pady=(6, 2))
+        self.analysis_x_combo = ttk.Combobox(scatter_box, textvariable=self.analysis_x_state, values=[], state="readonly")
+        self.analysis_x_combo.pack(fill="x", padx=6)
+        self.analysis_x_combo.bind("<<ComboboxSelected>>", self.on_analysis_scatter_select)
+        Label(scatter_box, text="Scatter Y", anchor="w").pack(fill="x", padx=6, pady=(8, 2))
+        self.analysis_y_combo = ttk.Combobox(scatter_box, textvariable=self.analysis_y_state, values=[], state="readonly")
+        self.analysis_y_combo.pack(fill="x", padx=6)
+        self.analysis_y_combo.bind("<<ComboboxSelected>>", self.on_analysis_scatter_select)
+        Label(scatter_box, text="Delta State", anchor="w").pack(fill="x", padx=6, pady=(8, 2))
+        self.analysis_delta_combo = ttk.Combobox(scatter_box, textvariable=self.analysis_delta_state, values=[], state="readonly")
+        self.analysis_delta_combo.pack(fill="x", padx=6)
+        self.analysis_delta_combo.bind("<<ComboboxSelected>>", self.on_analysis_delta_state_select)
+        Button(scatter_box, text="Rename States", command=self.rename_analysis_state_labels).pack(fill="x", padx=6, pady=(8, 2))
+        Button(scatter_box, text="Update Scatter", command=self.generate_analysis_plot_previews).pack(fill="x", padx=6, pady=2)
+        Button(scatter_box, text="Overlay Datasets", command=self.generate_dataset_overlay_plot_preview).pack(fill="x", padx=6, pady=(2, 6))
+        self.bind_plot_settings_mousewheel(settings_panel)
 
         table_frame = Frame(analysis_panes)
         analysis_panes.add(table_frame, weight=3)
@@ -954,8 +1762,32 @@ class OrigamiCounterApp:
         self.image_list.yview_scroll(-1 * int(event.delta / 120), "units")
         return "break"
 
+    def on_polymer_image_list_mousewheel(self, event) -> str:
+        self.polymer_image_list.yview_scroll(-1 * int(event.delta / 120), "units")
+        return "break"
+
     def on_label_summary_mousewheel(self, event) -> str:
         self.label_summary.yview_scroll(-1 * int(event.delta / 120), "units")
+        return "break"
+
+    def bind_plot_settings_mousewheel(self, widget) -> None:
+        widget.bind("<MouseWheel>", self.on_plot_settings_mousewheel, add="+")
+        widget.bind("<Button-4>", self.on_plot_settings_mousewheel, add="+")
+        widget.bind("<Button-5>", self.on_plot_settings_mousewheel, add="+")
+        for child in widget.winfo_children():
+            self.bind_plot_settings_mousewheel(child)
+
+    def on_plot_settings_mousewheel(self, event) -> str:
+        canvas = getattr(self, "plot_settings_canvas", None)
+        if canvas is None:
+            return "break"
+        if getattr(event, "num", None) == 4:
+            units = -1
+        elif getattr(event, "num", None) == 5:
+            units = 1
+        else:
+            units = -1 if event.delta > 0 else 1
+        canvas.yview_scroll(units, "units")
         return "break"
 
     def on_global_mousewheel(self, event) -> None:
@@ -1028,43 +1860,197 @@ class OrigamiCounterApp:
         if folder:
             self.open_root(Path(folder))
 
+    def parse_optional_float(self, value: str) -> float | None:
+        text = value.strip()
+        if not text:
+            return None
+        return float(text)
+
+    def spm_import_review_dialog(self, spm_paths: list[Path], source_root: Path, output_root: Path) -> tuple[int, int, list[str], bool]:
+        if not spm_paths:
+            return 0, 0, [], True
+
+        window = Toplevel(self.root)
+        window.title("Review and import SPM files")
+        window.geometry("900x780")
+        window.transient(self.root)
+        window.grab_set()
+
+        result = {"canceled": True}
+        converted_paths: set[Path] = set()
+        skipped_paths: set[Path] = set()
+        failed: list[str] = []
+        sample_idx = {"value": 0}
+        lower_iqr = StringVar(value="1.5")
+        upper_iqr = StringVar(value="1.5")
+        manual_lo = StringVar(value="")
+        manual_hi = StringVar(value="")
+        sample_text = StringVar(value="")
+        status_text = StringVar(value="")
+
+        controls = Frame(window)
+        controls.pack(fill="x", padx=10, pady=10)
+
+        Label(controls, text="Lower IQR multiplier").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        Entry(controls, textvariable=lower_iqr, width=8).grid(row=0, column=1, sticky="w", padx=(0, 16))
+        Label(controls, text="Upper IQR multiplier").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        Entry(controls, textvariable=upper_iqr, width=8).grid(row=0, column=3, sticky="w", padx=(0, 16))
+        Label(controls, text="Manual low").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        Entry(controls, textvariable=manual_lo, width=8).grid(row=1, column=1, sticky="w", padx=(0, 16), pady=(6, 0))
+        Label(controls, text="Manual high").grid(row=1, column=2, sticky="w", padx=(0, 6), pady=(6, 0))
+        Entry(controls, textvariable=manual_hi, width=8).grid(row=1, column=3, sticky="w", padx=(0, 16), pady=(6, 0))
+
+        sample_row = Frame(window)
+        sample_row.pack(fill="x", padx=10)
+        Button(sample_row, text="Previous", command=lambda: change_sample(-1)).pack(side=LEFT)
+        Label(sample_row, textvariable=sample_text, anchor="w").pack(side=LEFT, fill="x", expand=True)
+
+        preview_label = Label(window, bg="white")
+        preview_label.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        Label(window, textvariable=status_text, anchor="w", justify=LEFT).pack(fill="x", padx=10, pady=(0, 8))
+
+        actions = Frame(window)
+        actions.pack(fill="x", padx=10, pady=(0, 10))
+        next_button = Button(actions, text="")
+
+        def current_settings() -> SpmRenderSettings:
+            lo = self.parse_optional_float(manual_lo.get())
+            hi = self.parse_optional_float(manual_hi.get())
+            if (lo is None) != (hi is None):
+                raise ValueError("Manual low and manual high must both be set, or both left blank.")
+            if lo is not None and hi is not None and hi <= lo:
+                raise ValueError("Manual high must be greater than manual low.")
+            lower = float(lower_iqr.get())
+            upper = float(upper_iqr.get())
+            if not np.isfinite(lower) or not np.isfinite(upper) or lower < 0 or upper < 0:
+                raise ValueError("IQR multipliers must be finite numbers greater than or equal to 0.")
+            return SpmRenderSettings(
+                lower_iqr_multiplier=lower,
+                upper_iqr_multiplier=upper,
+                manual_lo=lo,
+                manual_hi=hi,
+            )
+
+        def update_preview() -> None:
+            try:
+                settings = current_settings()
+                spm_path = spm_paths[sample_idx["value"]]
+                height = read_spm_height_array(spm_path)
+                flattened = flatten_spm_height(height)
+                z_scale = parse_spm_z_nm_per_lsb(spm_path)
+                lo, hi = height_contrast_limits(flattened, settings)
+                image = render_spm_png(height, parse_spm_scan_size_um(spm_path), z_scale, settings)
+                image.thumbnail((860, 560), Image.Resampling.LANCZOS)
+                self.spm_import_preview_photo = ImageTk.PhotoImage(image)
+                preview_label.configure(image=self.spm_import_preview_photo)
+                if spm_path in converted_paths:
+                    review_state = "imported"
+                elif spm_path in skipped_paths:
+                    review_state = "skipped"
+                else:
+                    review_state = "not reviewed"
+                sample_text.set(f"Image {sample_idx['value'] + 1}/{len(spm_paths)}: {spm_path.name} ({review_state})")
+                if z_scale is not None and z_scale > 0:
+                    status_text.set(
+                        f"Display z range: {lo * z_scale:.3g} to {hi * z_scale:.3g} nm "
+                        f"({lo:.3g} to {hi:.3g} raw units)"
+                    )
+                else:
+                    status_text.set(f"Display z range: {lo:.3g} to {hi:.3g} raw units")
+                update_next_button()
+            except Exception as exc:
+                status_text.set(f"Preview failed: {exc}")
+
+        def change_sample(delta: int) -> None:
+            sample_idx["value"] = min(max(sample_idx["value"] + delta, 0), len(spm_paths) - 1)
+            update_preview()
+
+        def import_current_and_advance() -> None:
+            spm_path = spm_paths[sample_idx["value"]]
+            try:
+                settings = current_settings()
+                relative = spm_path.relative_to(source_root)
+                png_path = output_root / relative.parent / f"{spm_path.stem}.png"
+                self.status.set(f"Importing SPM {sample_idx['value'] + 1}/{len(spm_paths)}: {spm_path.name}")
+                self.root.update_idletasks()
+                convert_spm_to_png(spm_path, png_path, settings)
+                shutil.copy2(spm_path, png_path.with_suffix(".spm"))
+                converted_paths.add(spm_path)
+                if sample_idx["value"] >= len(spm_paths) - 1:
+                    result["canceled"] = False
+                    window.destroy()
+                    return
+                sample_idx["value"] += 1
+                update_preview()
+            except Exception as exc:
+                failed.append(f"{spm_path.name}: {exc}")
+                messagebox.showerror("SPM import failed", f"{spm_path.name}\n\n{exc}", parent=window)
+                return
+
+        def skip_current_and_advance() -> None:
+            spm_path = spm_paths[sample_idx["value"]]
+            skipped_paths.add(spm_path)
+            if sample_idx["value"] >= len(spm_paths) - 1:
+                result["canceled"] = False
+                window.destroy()
+                return
+            sample_idx["value"] += 1
+            update_preview()
+
+        def cancel() -> None:
+            result["canceled"] = True
+            window.destroy()
+
+        def update_next_button() -> None:
+            if sample_idx["value"] >= len(spm_paths) - 1:
+                next_button.configure(text="Import Current + Finish")
+            else:
+                next_button.configure(text="Import Current + Next")
+
+        Button(actions, text="Refresh Preview", command=update_preview).pack(side=LEFT)
+        Button(actions, text="Skip File", command=skip_current_and_advance).pack(side=RIGHT, padx=(6, 0))
+        next_button.configure(command=import_current_and_advance)
+        next_button.pack(side=RIGHT)
+        Button(actions, text="Cancel", command=cancel).pack(side=RIGHT, padx=(0, 6))
+        window.protocol("WM_DELETE_WINDOW", cancel)
+
+        update_preview()
+        self.root.wait_window(window)
+        return len(converted_paths), len(skipped_paths), failed, bool(result["canceled"])
+
     def import_spm_folder(self) -> None:
         folder = filedialog.askdirectory(initialdir=self.workspace, title="Choose folder containing SPM files")
         if not folder:
             return
         source_root = Path(folder)
-        spm_paths = sorted(path for path in source_root.rglob("*.spm") if path.is_file())
+        spm_paths = discover_spm_files(source_root)
         if not spm_paths:
             messagebox.showinfo("No SPM files", "No .spm files were found in the selected folder.")
             return
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_root = source_root / OUTPUT_DIR / f"spm_png_{timestamp}"
-        converted = 0
-        failed: list[str] = []
-        self.status.set(f"Converting {len(spm_paths)} SPM file(s) to flattened PNG...")
-        self.root.update_idletasks()
-        for idx, spm_path in enumerate(spm_paths, start=1):
-            try:
-                relative = spm_path.relative_to(source_root)
-                png_path = output_root / relative.parent / f"{spm_path.stem}.png"
-                self.status.set(f"Converting SPM {idx}/{len(spm_paths)}: {spm_path.name}")
-                self.root.update_idletasks()
-                convert_spm_to_png(spm_path, png_path)
-                shutil.copy2(spm_path, png_path.with_suffix(".spm"))
-                converted += 1
-            except Exception as exc:
-                failed.append(f"{spm_path.name}: {exc}")
+        output_root = source_root / CONVERTED_IMAGES_DIR / f"spm_png_{timestamp}"
+        converted, skipped, failed, canceled = self.spm_import_review_dialog(spm_paths, source_root, output_root)
 
         if converted == 0:
-            messagebox.showerror("SPM import failed", "No SPM files could be converted.\n\n" + "\n".join(failed[:8]))
-            self.status.set("SPM import failed.")
+            if canceled:
+                self.status.set("SPM import canceled.")
+            elif skipped:
+                self.status.set(f"SPM import complete. Skipped {skipped} file(s); no PNGs were imported.")
+                messagebox.showinfo("SPM import complete", f"Skipped {skipped} SPM file(s). No PNGs were imported.")
+            else:
+                messagebox.showerror("SPM import failed", "No SPM files could be converted.\n\n" + "\n".join(failed[:8]))
+                self.status.set("SPM import failed.")
             return
 
         self.open_root(output_root)
         message = f"Converted {converted} SPM file(s) to:\n{output_root}"
+        if skipped:
+            message += f"\n\nSkipped: {skipped}"
         if failed:
             message += f"\n\nFailed: {len(failed)}\n" + "\n".join(failed[:8])
+        if canceled:
+            message += "\n\nImport was canceled before all images were reviewed."
         self.status.set(f"Converted {converted} SPM file(s). Loaded converted PNG folder.")
         messagebox.showinfo("SPM import complete", message)
 
@@ -1084,12 +2070,26 @@ class OrigamiCounterApp:
         self.model = None
         self.images = discover_images(root)
         self.image_list.delete(0, END)
+        polymer_image_list = getattr(self, "polymer_image_list", None)
+        if polymer_image_list is not None:
+            polymer_image_list.delete(0, END)
         for path in self.images:
-            self.image_list.insert(END, str(path.relative_to(root)))
+            label = str(path.relative_to(root))
+            self.image_list.insert(END, label)
+            if polymer_image_list is not None:
+                polymer_image_list.insert(END, label)
         self.refresh_label_summary()
-        self.status.set(f"Found {len(self.images)} origami PNG images.")
+        spm_count = len(discover_spm_files(root))
+        if self.images:
+            self.status.set(f"Found {len(self.images)} supported image file(s).")
+        elif spm_count:
+            self.status.set(f"Found {spm_count} raw SPM file(s). Use Import SPM Folder to render them before analysis.")
+        else:
+            self.status.set(f"No supported image files found. Supported formats: {supported_image_extensions_text()}.")
         if self.images:
             self.image_list.selection_set(0)
+            if polymer_image_list is not None:
+                polymer_image_list.selection_set(0)
             self.load_image(self.images[0])
 
     def label_count_for_image(self, path: Path) -> int:
@@ -1131,7 +2131,7 @@ class OrigamiCounterApp:
             return
         self.clear_labels_for_path(path, clear_working=False, clear_training=True)
 
-    def load_image(self, path: Path) -> None:
+    def load_image(self, path: Path, update_classify_view: bool = True) -> None:
         self.current_image = path
         self.rgb = load_rgb(path)
         self.scan_bounds = scan_bbox(self.rgb)
@@ -1145,7 +2145,15 @@ class OrigamiCounterApp:
         elif "bar_um" in saved_scale:
             self.scale_bar_um.set(format_um(float(saved_scale["bar_um"])))
         self.update_scale_status()
-        self.fit_image()
+        self.sync_selected_image_lists(path)
+        restored_polymer = self.restore_polymer_analysis_from_cache(path)
+        if update_classify_view:
+            self.fit_image()
+        active_polymer_view = getattr(self, "polymer_view_mode", "analysis")
+        if active_polymer_view in {"figure_2b", "figure_c"}:
+            self.set_polymer_view(active_polymer_view)
+        else:
+            self.set_polymer_view("analysis")
 
     def current_bar_um(self) -> float:
         try:
@@ -1171,6 +2179,68 @@ class OrigamiCounterApp:
             return ScaleInfo(pixels_per_um=1.0, bar_pixels=1.0, bar_um=self.current_bar_um(), detected=False, source="fallback")
         return detect_scale_bar(image, self.current_bar_um())
 
+    def current_polymer_analysis_params(self) -> tuple[float, float, float]:
+        return (
+            float(self.polymer_min_length_nm.get()),
+            float(self.polymer_segment_nm.get()),
+            float(self.threshold_bias.get()),
+        )
+
+    def clear_current_polymer_analysis(self) -> None:
+        self.polymer_objects = []
+        self.polymer_persistence_nm = None
+        self.polymer_fit_r2 = None
+        self.polymer_msd_rows = []
+        self.polymer_status.set("")
+        self.polymer_figure_2b_photo = None
+        self.polymer_figure_c_photo = None
+        if hasattr(self, "polymer_progress"):
+            self.polymer_progress["value"] = 0
+        self.polymer_progress_text.set("")
+
+    def cache_current_polymer_analysis(self, figure_2b_image: Image.Image | None = None, figure_c_image: Image.Image | None = None) -> None:
+        if self.current_image is None:
+            return
+        try:
+            params = self.current_polymer_analysis_params()
+        except ValueError:
+            return
+        key = image_key(self.current_image)
+        existing = self.polymer_analysis_cache.get(key)
+        self.polymer_analysis_cache[key] = PolymerAnalysisResult(
+            params=params,
+            objects=list(self.polymer_objects),
+            msd_rows=[dict(row) for row in self.polymer_msd_rows],
+            persistence_nm=self.polymer_persistence_nm,
+            fit_r2=self.polymer_fit_r2,
+            status_text=self.polymer_status.get(),
+            figure_2b_image=figure_2b_image if figure_2b_image is not None else (existing.figure_2b_image if existing is not None else None),
+            figure_c_image=figure_c_image if figure_c_image is not None else (existing.figure_c_image if existing is not None else None),
+        )
+
+    def restore_polymer_analysis_from_cache(self, path: Path) -> bool:
+        self.clear_current_polymer_analysis()
+        result = self.polymer_analysis_cache.get(image_key(path))
+        if result is None:
+            return False
+        try:
+            current_params = self.current_polymer_analysis_params()
+        except ValueError:
+            return False
+        if result.params != current_params:
+            self.polymer_progress_text.set("Cached polymer analysis does not match current settings.")
+            return False
+        self.polymer_objects = list(result.objects)
+        self.polymer_msd_rows = [dict(row) for row in result.msd_rows]
+        self.polymer_persistence_nm = result.persistence_nm
+        self.polymer_fit_r2 = result.fit_r2
+        self.polymer_status.set(result.status_text)
+        if hasattr(self, "polymer_progress"):
+            self.polymer_progress["value"] = 100 if self.polymer_objects else 0
+        if self.polymer_objects:
+            self.polymer_progress_text.set("Restored cached polymer analysis.")
+        return bool(self.polymer_objects)
+
     def update_scale_status(self) -> None:
         if self.rgb is None:
             self.scale_status.set("")
@@ -1182,19 +2252,111 @@ class OrigamiCounterApp:
         else:
             self.scale_status.set(f"{note}: {scale_info.pixels_per_um:.1f} px/um ({scale_info.bar_pixels:.0f}px bar)")
 
+    def parse_target_size_area_um2(self, text: str) -> float | None:
+        clean = text.lower().replace("nm", "").replace("×", "x").strip()
+        if not clean:
+            return None
+        values = [float(value) for value in re.findall(r"\d+(?:\.\d+)?", clean)]
+        if not values:
+            return None
+        if len(values) == 1:
+            width_nm = height_nm = values[0]
+        else:
+            width_nm, height_nm = values[0], values[1]
+        if width_nm <= 0 or height_nm <= 0:
+            raise ValueError("Target size nm must be positive. Use a format like 100x150.")
+        return (width_nm * height_nm) / 1_000_000.0
+
+    def parse_size_range_factors(self, text: str) -> tuple[float, float]:
+        clean = text.strip().lower().replace("x", "")
+        if not clean:
+            return 0.35, 3.0
+        values = [float(value) for value in re.findall(r"\d+(?:\.\d+)?", clean)]
+        if not values:
+            raise ValueError("Size range must be a factor or range, for example 0.35-3.0.")
+        if len(values) == 1:
+            value = values[0]
+            if value <= 0:
+                raise ValueError("Size range factor must be positive.")
+            return 1.0 / value, value
+        low, high = values[0], values[1]
+        if low <= 0 or high <= 0:
+            raise ValueError("Size range factors must be positive.")
+        return min(low, high), max(low, high)
+
+    def target_size_area_bounds_um2(self, size_text: str, range_text: str) -> tuple[float, float] | None:
+        target_area_um2 = self.parse_target_size_area_um2(size_text)
+        if target_area_um2 is None:
+            return None
+        low_factor, high_factor = self.parse_size_range_factors(range_text)
+        return max(1e-9, target_area_um2 * low_factor), max(1e-9, target_area_um2 * high_factor)
+
+    def area_bounds_from_um2(self, scale_info: ScaleInfo, min_area_um2: float, max_area_um2: float) -> tuple[int, int]:
+        factor = scale_info.pixels_per_um * scale_info.pixels_per_um
+        min_area = max(4, int(round(min_area_um2 * factor)))
+        max_area = max(min_area + 10, int(round(max_area_um2 * factor)))
+        return min_area, max_area
+
+    def detection_area_bounds(
+        self,
+        scale_info: ScaleInfo,
+        min_area_value: float,
+        max_area_value: float,
+        use_physical_area: bool,
+        target_size_nm: str = "",
+        size_range_factor: str = "",
+    ) -> tuple[int, int]:
+        size_bounds = self.target_size_area_bounds_um2(target_size_nm, size_range_factor)
+        if size_bounds is not None:
+            return self.area_bounds_from_um2(scale_info, size_bounds[0], size_bounds[1])
+        if use_physical_area and self.min_area_um2 is not None and self.max_area_um2 is not None:
+            return self.area_bounds_from_um2(scale_info, self.min_area_um2, self.max_area_um2)
+        min_area = int(round(min_area_value))
+        max_area = int(round(max_area_value))
+        return max(4, min_area), max(max(4, min_area) + 10, max_area)
+
     def pixel_area_bounds(self, rgb: np.ndarray, path: Path | None = None) -> tuple[int, int, ScaleInfo]:
         scale_info = self.current_scale_info(rgb, path)
-        if self.min_area_um2 is not None and self.max_area_um2 is not None:
-            factor = scale_info.pixels_per_um * scale_info.pixels_per_um
-            min_area = max(4, int(round(self.min_area_um2 * factor)))
-            max_area = max(min_area + 10, int(round(self.max_area_um2 * factor)))
-            return min_area, max_area, scale_info
-        return int(float(self.min_area.get())), int(float(self.max_area.get())), scale_info
+        min_area, max_area = self.detection_area_bounds(
+            scale_info,
+            float(self.min_area.get()),
+            float(self.max_area.get()),
+            use_physical_area=True,
+            target_size_nm=self.target_size_nm.get(),
+            size_range_factor=self.size_range_factor.get(),
+        )
+        return min_area, max_area, scale_info
 
     def on_image_select(self, _event=None) -> None:
+        if self.syncing_image_selection:
+            return
         selection = self.image_list.curselection()
         if selection:
-            self.load_image(self.images[selection[0]])
+            self.load_image(self.images[selection[0]], update_classify_view=True)
+
+    def on_polymer_image_select(self, _event=None) -> None:
+        if self.syncing_image_selection:
+            return
+        selection = self.polymer_image_list.curselection()
+        if selection:
+            self.load_image(self.images[selection[0]], update_classify_view=False)
+
+    def sync_selected_image_lists(self, path: Path) -> None:
+        try:
+            index = self.images.index(path)
+        except ValueError:
+            return
+        self.syncing_image_selection = True
+        try:
+            for list_name in ("image_list", "polymer_image_list"):
+                image_list = getattr(self, list_name, None)
+                if image_list is None:
+                    continue
+                image_list.selection_clear(0, END)
+                image_list.selection_set(index)
+                image_list.see(index)
+        finally:
+            self.syncing_image_selection = False
 
     def fit_image(self) -> None:
         if self.rgb is None:
@@ -1235,7 +2397,7 @@ class OrigamiCounterApp:
         self.draw_overlays()
 
     def draw_overlays(self) -> None:
-        if not self.objects:
+        if not self.objects and not self.polymer_objects:
             return
         for obj in self.objects:
             minr, minc, maxr, maxc = obj.bbox
@@ -1251,6 +2413,26 @@ class OrigamiCounterApp:
             if label:
                 conf = f" {obj.confidence:.2f}" if obj.confidence is not None and not obj.label else ""
                 self.canvas.create_text(x1 + 3, y1 + 3, text=f"{label}{conf}", anchor="nw", fill=color, font=("Segoe UI", 10, "bold"))
+        for polymer in self.polymer_objects:
+            if len(polymer.points) < 2:
+                continue
+            offset_x, offset_y = self.image_offset
+            coords = []
+            for x, y in polymer.points:
+                coords.extend([x * self.scale + offset_x, y * self.scale + offset_y])
+            color = polymer_color_hex(polymer)
+            self.canvas.create_line(*coords, fill=color, width=2)
+            if polymer.excluded_reason:
+                continue
+            x0, y0 = polymer.points[0]
+            self.canvas.create_text(
+                x0 * self.scale + offset_x + 3,
+                y0 * self.scale + offset_y + 3,
+                text=str(polymer.object_id),
+                anchor="nw",
+                fill=color,
+                font=("Segoe UI", 10, "bold"),
+            )
 
     def start_area_box(self) -> None:
         if self.rgb is None:
@@ -1258,7 +2440,7 @@ class OrigamiCounterApp:
         self.area_box_mode = True
         self.scale_box_mode = False
         self.drag_start = None
-        self.status.set("Drag a box around one representative origami, then release.")
+        self.status.set("Drag a box around one representative origami to calibrate pixel area, then release.")
 
     def start_scale_box(self) -> None:
         if self.rgb is None:
@@ -1304,6 +2486,502 @@ class OrigamiCounterApp:
         except Exception as exc:
             if not silent:
                 messagebox.showerror("Detection failed", str(exc))
+
+    def update_polymer_progress(self, value: float, text: str) -> None:
+        progress = getattr(self, "polymer_progress", None)
+        if progress is not None:
+            progress["value"] = max(0.0, min(100.0, float(value)))
+        self.polymer_progress_text.set(text)
+        self.root.update_idletasks()
+
+    def analyze_current_polymers(self) -> None:
+        if self.rgb is None or self.current_image is None:
+            return
+        try:
+            self.update_polymer_progress(3, "Preparing polymer analysis...")
+            scale_info = self.current_scale_info(self.rgb, self.current_image)
+            min_length_nm = float(self.polymer_min_length_nm.get())
+            segment_nm = float(self.polymer_segment_nm.get())
+            if min_length_nm <= 0 or segment_nm <= 0:
+                raise ValueError("Min length and segment length must be positive.")
+            bias = float(self.threshold_bias.get())
+            self.update_polymer_progress(12, "Checking scale and thresholds...")
+            self.update_scale_status()
+            self.objects = []
+            self.update_polymer_progress(25, "Detecting and skeletonizing polymer contours...")
+            self.polymer_objects = detect_polymer_contours(self.rgb, scale_info.pixels_per_um, min_length_nm, bias)
+            accepted = [obj for obj in self.polymer_objects if not obj.excluded_reason]
+            self.update_polymer_progress(65, "Calculating mean-square end-to-end distances...")
+            self.polymer_msd_rows = polymer_msd_table(accepted, scale_info.pixels_per_um, segment_nm)
+            if self.polymer_msd_rows:
+                self.update_polymer_progress(78, "Fitting 2D WLC persistence length...")
+                x = np.asarray([row["contour_separation_nm"] for row in self.polymer_msd_rows], dtype=np.float64)
+                y = np.asarray([row["mean_square_end_to_end_nm2"] for row in self.polymer_msd_rows], dtype=np.float64)
+                self.polymer_persistence_nm, self.polymer_fit_r2 = fit_persistence_length_2d(x, y)
+                fit_text = f"Lp {self.polymer_persistence_nm:.1f} nm, R^2 {self.polymer_fit_r2:.3f}"
+            else:
+                self.polymer_persistence_nm = None
+                self.polymer_fit_r2 = None
+                fit_text = "not enough contour data for fit"
+            excluded = len(self.polymer_objects) - len(accepted)
+            mean_length = float(np.mean([obj.length_nm for obj in accepted])) if accepted else 0.0
+            self.polymer_status.set(
+                f"Accepted {len(accepted)} contours; excluded {excluded}.\n"
+                f"Mean length {mean_length:.1f} nm; {fit_text}."
+            )
+            self.status.set(f"Analyzed polymer contours in {self.current_image.name} using {scale_info.pixels_per_um:.1f} px/um.")
+            self.counts_text.set(f"Polymer contours: {len(accepted)} accepted, {excluded} excluded")
+            self.cache_current_polymer_analysis()
+            self.update_polymer_progress(90, "Refreshing previews...")
+            self.redraw()
+            self.set_polymer_view("analysis")
+            self.update_polymer_progress(100, "Polymer analysis complete.")
+        except Exception as exc:
+            self.update_polymer_progress(0, "Polymer analysis failed.")
+            messagebox.showerror("Polymer analysis failed", f"{exc}\n\n{traceback.format_exc()}")
+
+    def annotated_polymer_image(self) -> Image.Image:
+        if self.rgb is None:
+            raise ValueError("No image is loaded.")
+        image = Image.fromarray(self.rgb).convert("RGB")
+        draw = ImageDraw.Draw(image)
+        for polymer in self.polymer_objects:
+            if len(polymer.points) < 2:
+                continue
+            color = polymer_color_rgb(polymer)
+            draw.line(polymer.points, fill=color, width=4)
+            if polymer.excluded_reason:
+                continue
+            x, y = polymer.points[0]
+            draw.text((x + 4, y + 4), str(polymer.object_id), fill=color)
+        return image
+
+    def current_polymer_overlay_opacity(self) -> float:
+        try:
+            opacity = float(self.polymer_overlay_opacity.get())
+        except ValueError:
+            opacity = 0.55
+        opacity = max(0.0, min(1.0, opacity))
+        if self.polymer_overlay_opacity.get() != f"{opacity:.2g}":
+            self.polymer_overlay_opacity.set(f"{opacity:.2g}")
+        return opacity
+
+    def polymer_contour_layer(self, size: tuple[int, int], opacity: float, contours_only: bool = False) -> Image.Image:
+        layer = Image.new("RGBA", size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        alpha = 255 if contours_only else int(round(max(0.0, min(1.0, opacity)) * 255))
+        width = max(3, int(round(max(size) / 1400)))
+        for polymer in self.polymer_objects:
+            if len(polymer.points) < 2:
+                continue
+            red, green, blue = polymer_color_rgb(polymer)
+            color = (red, green, blue, alpha)
+            if not contours_only and alpha > 0:
+                draw.line(polymer.points, fill=(0, 0, 0, int(round(alpha * 0.45))), width=width + 3)
+            draw.line(polymer.points, fill=color, width=width)
+            if contours_only and not polymer.excluded_reason:
+                x, y = polymer.points[0]
+                draw.text((x + 4, y + 4), str(polymer.object_id), fill=color)
+        return layer
+
+    def polymer_preview_image(self) -> Image.Image:
+        if self.rgb is None:
+            raise ValueError("No image is loaded.")
+        base = Image.fromarray(self.rgb).convert("RGBA")
+        mode = self.polymer_preview_mode.get().strip().lower()
+        if mode == "original" or not self.polymer_objects:
+            return base.convert("RGB")
+        if mode == "contours":
+            background = Image.new("RGBA", base.size, (32, 33, 36, 255))
+            return Image.alpha_composite(background, self.polymer_contour_layer(base.size, 1.0, contours_only=True)).convert("RGB")
+        return Image.alpha_composite(base, self.polymer_contour_layer(base.size, self.current_polymer_overlay_opacity())).convert("RGB")
+
+    def polymer_fit_plot_image(self) -> Image.Image:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(7.6, 4.4))
+        if not self.polymer_msd_rows or self.polymer_persistence_nm is None:
+            ax.text(0.5, 0.5, "Run Analyze Polymers to generate the WLC fit.", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+        else:
+            x = np.asarray([row["contour_separation_nm"] for row in self.polymer_msd_rows], dtype=np.float64)
+            y = np.asarray([row["mean_square_end_to_end_nm2"] for row in self.polymer_msd_rows], dtype=np.float64)
+            counts = np.asarray([row["sample_count"] for row in self.polymer_msd_rows], dtype=np.float64)
+            sizes = 24.0 + 56.0 * counts / max(float(counts.max()), 1.0)
+            ax.scatter(x, y, s=sizes, color="#2ec4b6", edgecolor="#173f3a", linewidth=0.7, label="Measured contour separations")
+            fit_x = np.linspace(float(x.min()), float(x.max()), 240)
+            fit_y = wlc_mean_square_end_to_end_2d(fit_x, self.polymer_persistence_nm)
+            ax.plot(fit_x, fit_y, color="#ff5a5f", linewidth=2.0, label="2D WLC fit")
+            ax.set_xlabel("Contour separation lc (nm)")
+            ax.set_ylabel("<R^2> (nm^2)")
+            title = f"Persistence length Lp = {self.polymer_persistence_nm:.1f} nm"
+            if self.polymer_fit_r2 is not None:
+                title += f"   R^2 = {self.polymer_fit_r2:.4f}"
+            ax.set_title(title)
+            ax.grid(alpha=0.25)
+            ax.legend(loc="best")
+        fig.tight_layout()
+        buffer = io.BytesIO()
+        fig.savefig(buffer, format="png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        buffer.seek(0)
+        return Image.open(buffer).convert("RGB")
+
+    def polymer_figure_2b_plot_image(self) -> Image.Image:
+        if self.rgb is None or self.current_image is None:
+            raise ValueError("No image is loaded.")
+        scale_info = self.current_scale_info(self.rgb, self.current_image)
+        segment_nm = float(self.polymer_segment_nm.get())
+        return polymer_figure_2b_image(
+            self.rgb,
+            self.polymer_objects,
+            scale_info.pixels_per_um,
+            segment_nm,
+            title=self.current_image.name,
+        )
+
+    def polymer_figure_c_plot_image(self) -> Image.Image:
+        if self.rgb is None or self.current_image is None:
+            raise ValueError("No image is loaded.")
+        scale_info = self.current_scale_info(self.rgb, self.current_image)
+        return polymer_figure_c_image(self.rgb, self.polymer_objects, scale_info.pixels_per_um)
+
+    def cached_polymer_figure_2b_image(self) -> Image.Image | None:
+        if self.current_image is None:
+            return None
+        result = self.polymer_analysis_cache.get(image_key(self.current_image))
+        if result is None:
+            return None
+        try:
+            if result.params != self.current_polymer_analysis_params():
+                return None
+        except ValueError:
+            return None
+        return result.figure_2b_image
+
+    def cached_polymer_figure_c_image(self) -> Image.Image | None:
+        if self.current_image is None:
+            return None
+        result = self.polymer_analysis_cache.get(image_key(self.current_image))
+        if result is None:
+            return None
+        try:
+            if result.params != self.current_polymer_analysis_params():
+                return None
+        except ValueError:
+            return None
+        return result.figure_c_image
+
+    def ensure_current_polymer_analysis(self) -> bool:
+        if self.current_image is None or self.rgb is None:
+            return False
+        if not self.polymer_objects:
+            self.analyze_current_polymers()
+        return bool(self.polymer_objects)
+
+    def render_polymer_preview(self) -> None:
+        canvas = getattr(self, "polymer_canvas", None)
+        if canvas is None:
+            return
+        panes = getattr(self, "polymer_panes", None)
+        image_box = getattr(self, "polymer_image_box", None)
+        if panes is not None and image_box is not None and str(image_box) not in panes.panes():
+            return
+        canvas.delete("all")
+        if self.rgb is None:
+            canvas.create_text(16, 16, text="Open a root folder and select an AFM image.", anchor="nw", fill="white")
+            return
+        cw = max(canvas.winfo_width(), 100)
+        ch = max(canvas.winfo_height(), 100)
+        display = Image.fromarray(self.rgb).convert("RGB")
+        display.thumbnail((cw, ch), Image.Resampling.LANCZOS)
+        mode = self.polymer_preview_mode.get().strip().lower()
+        if self.polymer_objects and mode != "original":
+            scale_x = display.width / max(self.rgb.shape[1], 1)
+            scale_y = display.height / max(self.rgb.shape[0], 1)
+            if mode == "contours":
+                base = Image.new("RGBA", display.size, (32, 33, 36, 255))
+                opacity = 1.0
+            else:
+                base = display.convert("RGBA")
+                opacity = self.current_polymer_overlay_opacity()
+            layer = Image.new("RGBA", display.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(layer)
+            alpha = 255 if mode == "contours" else int(round(opacity * 255))
+            width = max(2, int(round(max(display.size) / 550)))
+            for polymer in self.polymer_objects:
+                if len(polymer.points) < 2:
+                    continue
+                points = [(x * scale_x, y * scale_y) for x, y in polymer.points]
+                red, green, blue = polymer_color_rgb(polymer)
+                color = (red, green, blue, alpha)
+                if mode != "contours" and alpha > 0:
+                    draw.line(points, fill=(0, 0, 0, int(round(alpha * 0.45))), width=width + 3)
+                draw.line(points, fill=color, width=width)
+                if polymer.excluded_reason:
+                    continue
+                x0, y0 = points[0]
+                label = str(polymer.object_id)
+                badge_alpha = 230 if mode == "contours" else max(160, alpha)
+                badge_w = max(16, 8 + 6 * len(label))
+                draw.rectangle((x0 + 4, y0 + 4, x0 + 4 + badge_w, y0 + 22), fill=(255, 255, 255, badge_alpha), outline=(0, 0, 0, badge_alpha))
+                draw.text((x0 + 8, y0 + 6), label, fill=(0, 0, 0, badge_alpha))
+            display = Image.alpha_composite(base, layer).convert("RGB")
+        self.polymer_preview_photo = ImageTk.PhotoImage(display)
+        x = max(0, (cw - display.width) // 2)
+        y = max(0, (ch - display.height) // 2)
+        canvas.create_image(x, y, image=self.polymer_preview_photo, anchor="nw")
+        canvas.configure(scrollregion=(0, 0, max(cw, display.width + x), max(ch, display.height + y)))
+
+    def render_polymer_fit_plot(self) -> None:
+        canvas = getattr(self, "polymer_plot_canvas", None)
+        if canvas is None:
+            return
+        panes = getattr(self, "polymer_panes", None)
+        plot_box = getattr(self, "polymer_plot_box", None)
+        if panes is not None and plot_box is not None and str(plot_box) not in panes.panes():
+            return
+        canvas.delete("all")
+        image = self.polymer_fit_plot_image()
+        cw = max(canvas.winfo_width(), 100)
+        ch = max(canvas.winfo_height(), 100)
+        display = image.copy()
+        display.thumbnail((cw, ch), Image.Resampling.LANCZOS)
+        self.polymer_plot_photo = ImageTk.PhotoImage(display)
+        x = max(0, (cw - display.width) // 2)
+        y = max(0, (ch - display.height) // 2)
+        canvas.create_image(x, y, image=self.polymer_plot_photo, anchor="nw")
+        canvas.configure(scrollregion=(0, 0, max(cw, display.width + x), max(ch, display.height + y)))
+
+    def render_polymer_figure_2b_preview(self, clear_if_empty: bool = False) -> None:
+        canvas = getattr(self, "polymer_figure_2b_canvas", None)
+        if canvas is None:
+            return
+        panes = getattr(self, "polymer_panes", None)
+        figure_box = getattr(self, "polymer_figure_2b_box", None)
+        if panes is not None and figure_box is not None and str(figure_box) not in panes.panes():
+            return
+        canvas.delete("all")
+        image = None if clear_if_empty else self.cached_polymer_figure_2b_image()
+        if image is None:
+            canvas.create_text(16, 16, text="Run Preview Figure 2b Plot to view aligned contours here.", anchor="nw")
+            return
+        cw = max(canvas.winfo_width(), 100)
+        ch = max(canvas.winfo_height(), 100)
+        display = image.copy()
+        display.thumbnail((cw, ch), Image.Resampling.LANCZOS)
+        self.polymer_figure_2b_photo = ImageTk.PhotoImage(display)
+        x = max(0, (cw - display.width) // 2)
+        y = max(0, (ch - display.height) // 2)
+        canvas.create_image(x, y, image=self.polymer_figure_2b_photo, anchor="nw")
+        canvas.configure(scrollregion=(0, 0, max(cw, display.width + x), max(ch, display.height + y)))
+
+    def render_polymer_figure_c_preview(self, clear_if_empty: bool = False) -> None:
+        canvas = getattr(self, "polymer_figure_c_canvas", None)
+        if canvas is None:
+            return
+        panes = getattr(self, "polymer_panes", None)
+        figure_box = getattr(self, "polymer_figure_c_box", None)
+        if panes is not None and figure_box is not None and str(figure_box) not in panes.panes():
+            return
+        canvas.delete("all")
+        image = None if clear_if_empty else self.cached_polymer_figure_c_image()
+        if image is None:
+            canvas.create_text(16, 16, text="Run Preview Figure C Plot to view crop/contour pairs here.", anchor="nw")
+            return
+        cw = max(canvas.winfo_width(), 100)
+        ch = max(canvas.winfo_height(), 100)
+        display = image.copy()
+        display.thumbnail((cw, ch), Image.Resampling.LANCZOS)
+        self.polymer_figure_c_photo = ImageTk.PhotoImage(display)
+        x = max(0, (cw - display.width) // 2)
+        y = max(0, (ch - display.height) // 2)
+        canvas.create_image(x, y, image=self.polymer_figure_c_photo, anchor="nw")
+        canvas.configure(scrollregion=(0, 0, max(cw, display.width + x), max(ch, display.height + y)))
+
+    def preview_current_polymer_figure_2b(self) -> None:
+        if not self.ensure_current_polymer_analysis():
+            return
+        cached = self.cached_polymer_figure_2b_image()
+        if cached is not None:
+            self.update_polymer_progress(100, "Restored cached Figure 2b preview.")
+            self.set_polymer_view("figure_2b")
+            return
+        try:
+            self.update_polymer_progress(10, "Preparing Figure 2b preview...")
+            self.update_polymer_progress(35, "Rendering Figure 2b contour panel...")
+            image = self.polymer_figure_2b_plot_image()
+            self.update_polymer_progress(75, "Caching Figure 2b preview...")
+            self.cache_current_polymer_analysis(figure_2b_image=image)
+            self.update_polymer_progress(90, "Displaying Figure 2b preview...")
+        except Exception as exc:
+            self.update_polymer_progress(0, "Figure 2b preview failed.")
+            messagebox.showerror("Figure 2b preview failed", f"{exc}\n\n{traceback.format_exc()}")
+            return
+        self.set_polymer_view("figure_2b")
+        self.update_polymer_progress(100, "Figure 2b preview ready.")
+
+    def preview_current_polymer_figure_c(self) -> None:
+        if not self.ensure_current_polymer_analysis():
+            return
+        cached = self.cached_polymer_figure_c_image()
+        if cached is not None:
+            self.update_polymer_progress(100, "Restored cached Figure C preview.")
+            self.set_polymer_view("figure_c")
+            return
+        try:
+            self.update_polymer_progress(10, "Preparing Figure C preview...")
+            self.update_polymer_progress(35, "Rendering Figure C crop/contour panel...")
+            image = self.polymer_figure_c_plot_image()
+            self.update_polymer_progress(75, "Caching Figure C preview...")
+            self.cache_current_polymer_analysis(figure_c_image=image)
+            self.update_polymer_progress(90, "Displaying Figure C preview...")
+        except Exception as exc:
+            self.update_polymer_progress(0, "Figure C preview failed.")
+            messagebox.showerror("Figure C preview failed", f"{exc}\n\n{traceback.format_exc()}")
+            return
+        self.set_polymer_view("figure_c")
+        self.update_polymer_progress(100, "Figure C preview ready.")
+
+    def export_current_polymer_figure_2b(self) -> None:
+        if not self.ensure_current_polymer_analysis():
+            return
+        if self.current_image is None:
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.current_image.stem)
+        output_dir = self.output_dir / "polymer_persistence" / f"{stem}_figure_2b_{timestamp}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        figure_path = output_dir / f"{stem}_figure_2b_contours.png"
+        try:
+            self.update_polymer_progress(10, "Preparing Figure 2b export...")
+            self.update_polymer_progress(35, "Rendering Figure 2b contour panel...")
+            image = self.polymer_figure_2b_plot_image()
+            self.update_polymer_progress(70, "Saving Figure 2b image...")
+            image.save(figure_path)
+            self.update_polymer_progress(85, "Caching and displaying Figure 2b export...")
+            self.cache_current_polymer_analysis(figure_2b_image=image)
+            self.set_polymer_view("figure_2b")
+            self.update_polymer_progress(100, "Figure 2b export complete.")
+            self.status.set(f"Exported Figure 2b-style polymer plot to {figure_path}.")
+            messagebox.showinfo("Figure 2b plot exported", f"Saved Figure 2b-style contour plot to:\n{figure_path}")
+        except Exception as exc:
+            self.update_polymer_progress(0, "Figure 2b export failed.")
+            messagebox.showerror("Figure 2b export failed", f"{exc}\n\n{traceback.format_exc()}")
+
+    def export_current_polymer_figure_c(self) -> None:
+        if not self.ensure_current_polymer_analysis():
+            return
+        if self.current_image is None:
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.current_image.stem)
+        output_dir = self.output_dir / "polymer_persistence" / f"{stem}_figure_c_{timestamp}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        figure_path = output_dir / f"{stem}_figure_c_crops_contours.png"
+        try:
+            self.update_polymer_progress(10, "Preparing Figure C export...")
+            self.update_polymer_progress(35, "Rendering Figure C crop/contour panel...")
+            image = self.polymer_figure_c_plot_image()
+            self.update_polymer_progress(70, "Saving Figure C image...")
+            image.save(figure_path)
+            self.update_polymer_progress(85, "Caching and displaying Figure C export...")
+            self.cache_current_polymer_analysis(figure_c_image=image)
+            self.set_polymer_view("figure_c")
+            self.update_polymer_progress(100, "Figure C export complete.")
+            self.status.set(f"Exported Figure C-style polymer plot to {figure_path}.")
+            messagebox.showinfo("Figure C plot exported", f"Saved Figure C-style crop/contour plot to:\n{figure_path}")
+        except Exception as exc:
+            self.update_polymer_progress(0, "Figure C export failed.")
+            messagebox.showerror("Figure C export failed", f"{exc}\n\n{traceback.format_exc()}")
+
+    def export_current_polymer_results(self) -> None:
+        if not self.ensure_current_polymer_analysis():
+            return
+        if self.current_image is None or self.rgb is None:
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.current_image.stem)
+        output_dir = self.output_dir / "polymer_persistence" / f"{stem}_{timestamp}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        scale_info = self.current_scale_info(self.rgb, self.current_image)
+        accepted = [obj for obj in self.polymer_objects if not obj.excluded_reason]
+        self.update_polymer_progress(5, "Preparing polymer result export...")
+
+        summary_path = output_dir / f"{stem}_polymer_summary.csv"
+        self.update_polymer_progress(15, "Writing summary CSV...")
+        with summary_path.open("w", newline="", encoding="utf-8") as f:
+            fieldnames = [
+                "image",
+                "path",
+                "pixels_per_um",
+                "accepted_contours",
+                "excluded_contours",
+                "segment_nm",
+                "persistence_length_nm",
+                "fit_r2",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "image": self.current_image.name,
+                    "path": str(self.current_image),
+                    "pixels_per_um": f"{scale_info.pixels_per_um:.6g}",
+                    "accepted_contours": len(accepted),
+                    "excluded_contours": len(self.polymer_objects) - len(accepted),
+                    "segment_nm": self.polymer_segment_nm.get(),
+                    "persistence_length_nm": "" if self.polymer_persistence_nm is None else f"{self.polymer_persistence_nm:.6g}",
+                    "fit_r2": "" if self.polymer_fit_r2 is None else f"{self.polymer_fit_r2:.6g}",
+                }
+            )
+
+        contours_path = output_dir / f"{stem}_polymer_contours.csv"
+        self.update_polymer_progress(25, "Writing contour CSV...")
+        with contours_path.open("w", newline="", encoding="utf-8") as f:
+            fieldnames = ["object_id", "accepted", "excluded_reason", "length_nm", "end_to_end_nm", "segment_count", "points_xy"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for obj in self.polymer_objects:
+                writer.writerow(
+                    {
+                        "object_id": obj.object_id,
+                        "accepted": "yes" if not obj.excluded_reason else "no",
+                        "excluded_reason": obj.excluded_reason,
+                        "length_nm": f"{obj.length_nm:.6g}",
+                        "end_to_end_nm": f"{obj.end_to_end_nm:.6g}",
+                        "segment_count": obj.segment_count,
+                        "points_xy": json.dumps([[round(x, 3), round(y, 3)] for x, y in obj.points]),
+                    }
+                )
+
+        msd_path = output_dir / f"{stem}_polymer_msd.csv"
+        self.update_polymer_progress(35, "Writing MSD CSV...")
+        with msd_path.open("w", newline="", encoding="utf-8") as f:
+            fieldnames = ["contour_separation_nm", "mean_square_end_to_end_nm2", "sample_count"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self.polymer_msd_rows)
+
+        self.update_polymer_progress(45, "Saving source and annotated images...")
+        Image.fromarray(self.rgb).save(output_dir / self.current_image.name)
+        self.annotated_polymer_image().save(output_dir / f"{stem}_polymer_annotated.png")
+        self.update_polymer_progress(58, "Rendering WLC fit plot...")
+        self.polymer_fit_plot_image().save(output_dir / f"{stem}_polymer_wlc_fit.png")
+        self.update_polymer_progress(70, "Rendering Figure 2b plot...")
+        figure_2b = self.cached_polymer_figure_2b_image() or self.polymer_figure_2b_plot_image()
+        figure_2b.save(output_dir / f"{stem}_figure_2b_contours.png")
+        self.update_polymer_progress(84, "Rendering Figure C plot...")
+        figure_c = self.cached_polymer_figure_c_image() or self.polymer_figure_c_plot_image()
+        figure_c.save(output_dir / f"{stem}_figure_c_crops_contours.png")
+        self.update_polymer_progress(95, "Caching exported previews...")
+        self.cache_current_polymer_analysis(figure_2b_image=figure_2b, figure_c_image=figure_c)
+        self.update_polymer_progress(100, "Polymer result export complete.")
+        self.status.set(f"Exported polymer analysis to {output_dir}.")
+        messagebox.showinfo("Polymer results exported", f"Saved polymer CSVs and annotated image to:\n{output_dir}")
 
     def on_canvas_press(self, event) -> None:
         self.drag_start = (event.x, event.y)
@@ -1391,19 +3069,19 @@ class OrigamiCounterApp:
         p1 = self.canvas_to_image(*start)
         p2 = self.canvas_to_image(*end)
         if p1 is None or p2 is None or self.rgb is None:
-            self.status.set("Area box was outside the image. Try again.")
+            self.status.set("Pixel area box was outside the image. Try again.")
             return
         x1, y1 = p1
         x2, y2 = p2
         minc, maxc = sorted((int(round(x1)), int(round(x2))))
         minr, maxr = sorted((int(round(y1)), int(round(y2))))
         if maxc - minc < 4 or maxr - minr < 4:
-            self.status.set("Area box was too small. Drag around one origami.")
+            self.status.set("Pixel area box was too small. Drag around one origami.")
             return
         if self.scan_bounds is not None:
             scan_minr, scan_minc, scan_maxr, scan_maxc = self.scan_bounds
             if minr < scan_minr or maxr > scan_maxr or minc < scan_minc or maxc > scan_maxc:
-                self.status.set("Draw the area box inside the AFM scan region, not over labels or scale bars.")
+                self.status.set("Draw the pixel area box inside the AFM scan region, not over labels or scale bars.")
                 return
 
         crop = self.rgb[minr:maxr, minc:maxc]
@@ -1416,7 +3094,7 @@ class OrigamiCounterApp:
         max_area = max(min_area + 10, int(round(self.max_area_um2 * scale_info.pixels_per_um * scale_info.pixels_per_um)))
         self.min_area.set(str(min_area))
         self.max_area.set(str(max_area))
-        self.status.set(f"Area calibrated: {estimated_area_um2:.4f} um^2 ({estimated_area:.0f} px here). Detecting...")
+        self.status.set(f"Pixel area calibrated: {estimated_area:.0f} px here ({estimated_area_um2:.4f} um^2). Detecting...")
         self.detect_current(silent=True)
 
     def estimate_area_from_box(self, crop: np.ndarray) -> float:
@@ -1429,7 +3107,7 @@ class OrigamiCounterApp:
         high = smooth > threshold
         low = smooth < threshold
         binary = high if high.sum() <= low.sum() else low
-        binary = morphology.remove_small_objects(binary, max_size=4)
+        binary = remove_small_objects_compat(binary, 4)
         labels = measure.label(binary)
         areas = [float(prop.area) for prop in measure.regionprops(labels)]
         if areas:
@@ -1749,20 +3427,38 @@ class OrigamiCounterApp:
     def classify_path(self, path: Path) -> tuple[np.ndarray, list[OrigamiObject], dict[str, str | int]]:
         if self.model is None:
             raise ValueError("Train or load a classifier first.")
-        return self.classify_path_with_settings(path, float(self.min_area.get()), float(self.max_area.get()), float(self.threshold_bias.get()), use_physical_area=True)
+        return self.classify_path_with_settings(
+            path,
+            float(self.min_area.get()),
+            float(self.max_area.get()),
+            float(self.threshold_bias.get()),
+            use_physical_area=True,
+            target_size_nm=self.target_size_nm.get(),
+            size_range_factor=self.size_range_factor.get(),
+        )
 
-    def classify_path_with_settings(self, path: Path, min_area_value: float, max_area_value: float, threshold_bias: float, use_physical_area: bool = False) -> tuple[np.ndarray, list[OrigamiObject], dict[str, str | int]]:
+    def classify_path_with_settings(
+        self,
+        path: Path,
+        min_area_value: float,
+        max_area_value: float,
+        threshold_bias: float,
+        use_physical_area: bool = False,
+        target_size_nm: str = "",
+        size_range_factor: str = "",
+    ) -> tuple[np.ndarray, list[OrigamiObject], dict[str, str | int]]:
         if self.model is None:
             raise ValueError("Train or load a classifier first.")
         rgb = load_rgb(path)
         scale_info = self.current_scale_info(rgb, path)
-        if use_physical_area and self.min_area_um2 is not None and self.max_area_um2 is not None:
-            factor = scale_info.pixels_per_um * scale_info.pixels_per_um
-            min_area = max(4, int(round(self.min_area_um2 * factor)))
-            max_area = max(min_area + 10, int(round(self.max_area_um2 * factor)))
-        else:
-            min_area = int(round(min_area_value))
-            max_area = int(round(max_area_value))
+        min_area, max_area = self.detection_area_bounds(
+            scale_info,
+            min_area_value,
+            max_area_value,
+            use_physical_area,
+            target_size_nm=target_size_nm,
+            size_range_factor=size_range_factor,
+        )
         objects = detect_origami(rgb, min_area, max_area, threshold_bias, scale_info.pixels_per_um)
         counts = {state: 0 for state in self.states}
         if objects:
@@ -1808,7 +3504,9 @@ class OrigamiCounterApp:
             writer.writeheader()
             writer.writerow(row)
         Image.fromarray(rgb).save(output_dir / path.name)
-        self.annotated_image(rgb, objects).save(output_dir / f"{stem}_annotated.png")
+        detected_image = self.annotated_image(rgb, objects)
+        detected_image.save(output_dir / f"{stem}_detected.png")
+        detected_image.save(output_dir / f"{stem}_annotated.png")
         return output_dir
 
     def classify_export_all_images(self) -> None:
@@ -1816,7 +3514,7 @@ class OrigamiCounterApp:
             messagebox.showwarning("No classifier", "Train or load a classifier first.")
             return
         if not self.images:
-            messagebox.showwarning("No images", "Open a root folder with origami PNG images first.")
+            messagebox.showwarning("No images", f"Open a root folder with supported image files first: {supported_image_extensions_text()}.")
             return
         if messagebox.askyesno("Inspect before export?", "Review each classified image before saving?\n\nChoose No to bypass inspection and export all images immediately."):
             self.start_classify_export_review()
@@ -1861,12 +3559,18 @@ class OrigamiCounterApp:
 
         toolbar = Frame(window)
         toolbar.pack(fill="x", padx=8, pady=8)
-        Label(toolbar, text="Min area").pack(side=LEFT)
+        Label(toolbar, text="Min pixel area").pack(side=LEFT)
         self.export_review_min_area = StringVar(value=self.min_area.get())
         Entry(toolbar, textvariable=self.export_review_min_area, width=8).pack(side=LEFT, padx=(4, 8))
-        Label(toolbar, text="Max area").pack(side=LEFT)
+        Label(toolbar, text="Max pixel area").pack(side=LEFT)
         self.export_review_max_area = StringVar(value=self.max_area.get())
         Entry(toolbar, textvariable=self.export_review_max_area, width=8).pack(side=LEFT, padx=(4, 8))
+        Label(toolbar, text="Target nm").pack(side=LEFT)
+        self.export_review_target_size_nm = StringVar(value=self.target_size_nm.get())
+        Entry(toolbar, textvariable=self.export_review_target_size_nm, width=9).pack(side=LEFT, padx=(4, 8))
+        Label(toolbar, text="Size range multiple").pack(side=LEFT)
+        self.export_review_size_range = StringVar(value=self.size_range_factor.get())
+        Entry(toolbar, textvariable=self.export_review_size_range, width=8).pack(side=LEFT, padx=(4, 8))
         Label(toolbar, text="Bias").pack(side=LEFT)
         self.export_review_bias = StringVar(value=self.threshold_bias.get())
         Entry(toolbar, textvariable=self.export_review_bias, width=8).pack(side=LEFT, padx=(4, 8))
@@ -1914,6 +3618,8 @@ class OrigamiCounterApp:
                 float(self.export_review_max_area.get()),
                 float(self.export_review_bias.get()),
                 use_physical_area=False,
+                target_size_nm=self.export_review_target_size_nm.get(),
+                size_range_factor=self.export_review_size_range.get(),
             )
         except Exception as exc:
             messagebox.showerror("Classification failed", f"{exc}\n\n{traceback.format_exc()}")
@@ -2053,6 +3759,11 @@ class OrigamiCounterApp:
         plt.savefig(output_dir / "total_counts.png", dpi=180, bbox_inches="tight")
         plt.close()
 
+        raw_rows_for_mean, _raw_states_for_mean = self.read_filtered_count_rows_and_states(csv_path, apply_state_filter=False)
+        self.plot_total_counts_per_image(plt, raw_rows_for_mean)
+        plt.savefig(output_dir / "total_counts_per_image.png", dpi=180, bbox_inches="tight")
+        plt.close()
+
         scatter_states = self.selected_scatter_states(state_columns)
         if scatter_states is not None:
             a_state, b_state = self.plot_fraction_scatter(plt, rows, fractions, totals, state_columns, group_mode)
@@ -2123,6 +3834,10 @@ class OrigamiCounterApp:
         plt.title(f"Total origami detected/classified by {group_mode.lower()}")
         plt.tight_layout()
         previews["total_counts.png"] = self.plot_image_from_current_figure()
+
+        raw_rows_for_mean, _raw_states_for_mean = self.read_filtered_count_rows_and_states(csv_path, apply_state_filter=False)
+        self.plot_total_counts_per_image(plt, raw_rows_for_mean)
+        previews["total_counts_per_image.png"] = self.plot_image_from_current_figure()
 
         scatter_states = self.selected_scatter_states(state_columns)
         if scatter_states is not None:
@@ -2832,8 +4547,73 @@ class OrigamiCounterApp:
             row.pop("_sort_key", None)
         return sorted_groups
 
+    def total_counts_per_image_rows(self, rows: list[dict[str, str]]) -> tuple[list[str], list[float], list[int], str]:
+        mode = self.analysis_group_mode()
+        grouped: dict[tuple[str, ...], dict[str, object]] = {}
+        for row in rows:
+            image_name = row.get("image", "")
+            dataset_label = row.get("dataset", row.get("_analysis_dataset", "dataset"))
+            origami_label = self.parse_origami_label(image_name)
+            scale_label = self.count_row_scale_label(row)
+            if mode == "Images":
+                key = (dataset_label, image_name)
+                label = image_name
+                sort_key = f"{dataset_label}_{self.origami_sort_value(image_name)[0]:09d}_{self.scale_sort_value_from_label(scale_label):012.6f}_{image_name}"
+            elif mode == "Dataset":
+                key = (dataset_label,)
+                label = dataset_label
+                sort_key = dataset_label
+            elif mode == "Origami":
+                key = (origami_label,)
+                label = f"origami{origami_label}"
+                sort_key = f"{self.origami_sort_value(image_name)[0]:09d}_{origami_label}"
+            elif mode == "Scale":
+                key = (scale_label,)
+                label = scale_label
+                sort_key = f"{self.scale_sort_value_from_label(scale_label):012.6f}_{scale_label}"
+            elif mode == "Origami + Scale":
+                key = (origami_label, scale_label)
+                label = f"origami{origami_label} {scale_label}"
+                sort_key = f"{self.origami_sort_value(image_name)[0]:09d}_{self.scale_sort_value_from_label(scale_label):012.6f}_{origami_label}_{scale_label}"
+            elif mode == "Dataset + Origami":
+                key = (dataset_label, origami_label)
+                label = f"{dataset_label} origami{origami_label}"
+                sort_key = f"{dataset_label}_{self.origami_sort_value(image_name)[0]:09d}_{origami_label}"
+            elif mode == "Dataset + Scale":
+                key = (dataset_label, scale_label)
+                label = f"{dataset_label} {scale_label}"
+                sort_key = f"{dataset_label}_{self.scale_sort_value_from_label(scale_label):012.6f}_{scale_label}"
+            else:
+                key = (dataset_label, origami_label, scale_label)
+                label = f"{dataset_label} origami{origami_label} {scale_label}"
+                sort_key = f"{dataset_label}_{self.origami_sort_value(image_name)[0]:09d}_{self.scale_sort_value_from_label(scale_label):012.6f}_{origami_label}_{scale_label}"
+            group = grouped.setdefault(key, {"label": label, "sort_key": sort_key, "total": 0.0, "n": 0})
+            group["total"] = float(group["total"]) + float(row.get("total_detected", 0) or 0)
+            group["n"] = int(group["n"]) + 1
+
+        ordered = sorted(grouped.values(), key=lambda group: str(group["sort_key"]))
+        labels = [str(group["label"]) for group in ordered]
+        means = [float(group["total"]) / int(group["n"]) if int(group["n"]) else 0.0 for group in ordered]
+        image_counts = [int(group["n"]) for group in ordered]
+        return labels, means, image_counts, mode
+
+    def plot_total_counts_per_image(self, plt, rows: list[dict[str, str]]) -> None:
+        labels, means, image_counts, group_mode = self.total_counts_per_image_rows(rows)
+        x = np.arange(len(labels))
+        short_labels = [label[:28] + ("..." if len(label) > 28 else "") for label in labels]
+        fig_width = max(8, min(24, len(labels) * 0.55 + 4))
+        plt.figure(figsize=(fig_width, 4.5))
+        plt.bar(x, means, color="#4c78a8")
+        for idx, (mean, n_images) in enumerate(zip(means, image_counts)):
+            plt.text(idx, mean, f"n={n_images}", ha="center", va="bottom", fontsize=8)
+        plt.xticks(x, short_labels, rotation=45, ha="right")
+        plt.ylabel("Mean total count per image")
+        plt.title(f"Total counts per image by {group_mode.lower()}")
+        plt.tight_layout()
+
     def configure_analysis_filter_options(self, rows: list[dict[str, str]]) -> None:
         self.analysis_dataset_options = sorted({row.get("dataset", row.get("_analysis_dataset", "")) for row in rows if row.get("dataset", row.get("_analysis_dataset", ""))})
+        self.analysis_image_options = sorted({row.get("image", "") for row in rows if row.get("image", "")}, key=lambda name: (self.origami_sort_value(name), name))
         self.analysis_scale_options = sorted({self.count_row_scale_label(row) for row in rows}, key=self.scale_sort_value_from_label)
         self.analysis_origami_options = sorted({self.parse_origami_label(row.get("image", "")) for row in rows}, key=lambda label: self.origami_sort_value(f"origami{label}_"))
         self.analysis_state_options = self.count_state_columns(self.analysis_fieldnames, rows)
@@ -2841,6 +4621,10 @@ class OrigamiCounterApp:
             self.analysis_dataset_filter &= set(self.analysis_dataset_options)
             if not self.analysis_dataset_filter:
                 self.analysis_dataset_filter = None
+        if self.analysis_image_filter is not None:
+            self.analysis_image_filter &= set(self.analysis_image_options)
+            if not self.analysis_image_filter:
+                self.analysis_image_filter = None
         if self.analysis_scale_filter is not None:
             self.analysis_scale_filter &= set(self.analysis_scale_options)
             if not self.analysis_scale_filter:
@@ -2860,6 +4644,8 @@ class OrigamiCounterApp:
         for row in rows:
             if self.analysis_dataset_filter is not None and row.get("dataset", row.get("_analysis_dataset", "")) not in self.analysis_dataset_filter:
                 continue
+            if self.analysis_image_filter is not None and row.get("image", "") not in self.analysis_image_filter:
+                continue
             if self.analysis_scale_filter is not None and self.count_row_scale_label(row) not in self.analysis_scale_filter:
                 continue
             if self.analysis_origami_filter is not None and self.parse_origami_label(row.get("image", "")) not in self.analysis_origami_filter:
@@ -2869,10 +4655,11 @@ class OrigamiCounterApp:
 
     def update_analysis_filter_status(self) -> None:
         dataset_text = "all datasets" if self.analysis_dataset_filter is None else f"{len(self.analysis_dataset_filter)} dataset(s)"
+        image_text = "all images" if self.analysis_image_filter is None else f"{len(self.analysis_image_filter)} image(s)"
         scale_text = "all scales" if self.analysis_scale_filter is None else f"{len(self.analysis_scale_filter)} scale(s)"
         origami_text = "all origami" if self.analysis_origami_filter is None else f"{len(self.analysis_origami_filter)} origami"
         state_text = "all states" if self.analysis_state_filter is None else f"{len(self.analysis_state_filter)} state(s)"
-        self.analysis_filter_status.set(f"Filters: {dataset_text}, {scale_text}, {origami_text}, {state_text}")
+        self.analysis_filter_status.set(f"Filters: {dataset_text}, {image_text}, {scale_text}, {origami_text}, {state_text}")
 
     def filtered_state_columns(self, state_columns: list[str]) -> list[str]:
         state_filter = getattr(self, "analysis_state_filter", None)
@@ -2975,7 +4762,20 @@ class OrigamiCounterApp:
         Button(controls, text="Apply", command=apply).pack(side=RIGHT)
 
     def count_state_columns(self, fieldnames: list[str], rows: list[dict[str, str]]) -> list[str]:
-        meta_columns = {"date_folder", "image", "path", "pixels_per_um", "total_detected", "scale", "total", "total_count", "dataset"}
+        meta_columns = {
+            "date_folder",
+            "image",
+            "path",
+            "pixels_per_um",
+            "min_area_px",
+            "max_area_px",
+            "threshold_bias",
+            "total_detected",
+            "scale",
+            "total",
+            "total_count",
+            "dataset",
+        }
         state_columns = []
         for field in fieldnames:
             if field in meta_columns or field.startswith("fraction_") or field.startswith("count_") or field.endswith("_ratio"):
@@ -3323,6 +5123,7 @@ class OrigamiCounterApp:
                 self.plot_list.insert(END, name)
             if self.plot_previews:
                 self.plot_list.selection_set(0)
+                self.plot_preview_fit_to_window = True
                 self.show_plot_preview(next(iter(self.plot_previews)))
             self.analysis_status.set(f"Generated {len(self.plot_previews)} plot preview(s). Select one to view or save.")
         except Exception as exc:
@@ -3422,6 +5223,27 @@ class OrigamiCounterApp:
             display=lambda value: value,
         )
 
+    def choose_analysis_image_filter(self) -> None:
+        self.choose_analysis_filter(
+            title="Filter Images",
+            options=self.analysis_image_options,
+            selected=self.analysis_image_filter,
+            apply_callback=self.apply_analysis_image_filter,
+            display=self.analysis_image_filter_label,
+        )
+
+    def analysis_image_filter_label(self, image_name: str) -> str:
+        matching_rows = [row for row in self.analysis_source_rows if row.get("image", "") == image_name]
+        origami_label = self.parse_origami_label(image_name)
+        scale_labels = sorted({self.count_row_scale_label(row) for row in matching_rows if self.count_row_scale_label(row)}, key=self.scale_sort_value_from_label)
+        dataset_labels = sorted({row.get("dataset", row.get("_analysis_dataset", "")) for row in matching_rows if row.get("dataset", row.get("_analysis_dataset", ""))})
+        parts = [image_name, f"origami {origami_label}"]
+        if scale_labels:
+            parts.append(", ".join(scale_labels))
+        if len(dataset_labels) > 1:
+            parts.append(", ".join(dataset_labels))
+        return " | ".join(parts)
+
     def choose_analysis_origami_filter(self) -> None:
         self.choose_analysis_filter(
             title="Filter Origami",
@@ -3446,7 +5268,7 @@ class OrigamiCounterApp:
             return
         window = Toplevel(self.root)
         window.title(title)
-        window.geometry("320x420")
+        window.geometry("520x420")
 
         frame = Frame(window)
         frame.pack(fill=BOTH, expand=True, padx=8, pady=8)
@@ -3489,6 +5311,12 @@ class OrigamiCounterApp:
         if self.analysis_csv_path is not None:
             self.generate_analysis_plot_previews()
 
+    def apply_analysis_image_filter(self, selected: set[str] | None) -> None:
+        self.analysis_image_filter = selected
+        self.update_analysis_filter_status()
+        if self.analysis_csv_path is not None:
+            self.generate_analysis_plot_previews()
+
     def apply_analysis_origami_filter(self, selected: set[str] | None) -> None:
         self.analysis_origami_filter = selected
         self.update_analysis_filter_status()
@@ -3503,6 +5331,7 @@ class OrigamiCounterApp:
 
     def clear_analysis_plot_filters(self) -> None:
         self.analysis_dataset_filter = None
+        self.analysis_image_filter = None
         self.analysis_scale_filter = None
         self.analysis_origami_filter = None
         self.analysis_state_filter = None
@@ -3784,6 +5613,7 @@ class OrigamiCounterApp:
         if image is None:
             return
         self.current_plot_preview_name = name
+        self.plot_preview_fit_to_window = True
         self.render_plot_preview()
 
     def render_plot_preview(self) -> None:
@@ -3797,7 +5627,13 @@ class OrigamiCounterApp:
         image = self.plot_previews.get(self.current_plot_preview_name)
         if image is None:
             return
-        zoom = max(0.25, min(5.0, self.plot_preview_zoom))
+        if self.plot_preview_fit_to_window:
+            canvas_w = self.plot_preview_canvas.winfo_width() - 16
+            canvas_h = self.plot_preview_canvas.winfo_height() - 16
+            if canvas_w > 50 and canvas_h > 50:
+                fit_zoom = min(canvas_w / max(1, image.width), canvas_h / max(1, image.height), 1.0)
+                self.plot_preview_zoom = max(0.05, min(5.0, fit_zoom))
+        zoom = max(0.05, min(5.0, self.plot_preview_zoom))
         width = max(1, int(round(image.width * zoom)))
         height = max(1, int(round(image.height * zoom)))
         resized = image.resize((width, height), Image.Resampling.LANCZOS)
@@ -3807,11 +5643,12 @@ class OrigamiCounterApp:
         self.plot_zoom_status.set(f"{int(round(zoom * 100))}%")
 
     def adjust_plot_preview_zoom(self, factor: float) -> None:
+        self.plot_preview_fit_to_window = False
         self.plot_preview_zoom = max(0.25, min(5.0, self.plot_preview_zoom * factor))
         self.render_plot_preview()
 
     def reset_plot_preview_zoom(self) -> None:
-        self.plot_preview_zoom = 1.0
+        self.plot_preview_fit_to_window = True
         self.render_plot_preview()
 
     def save_selected_plot_preview(self) -> None:
@@ -3843,6 +5680,221 @@ class OrigamiCounterApp:
             image.save(folder_path / name)
         self.analysis_status.set(f"Saved {len(self.plot_previews)} plot(s) to {folder_path}.")
         messagebox.showinfo("Plots saved", f"Saved {len(self.plot_previews)} plot(s) to:\n{folder_path}")
+
+    def detect_count_fieldnames(self) -> list[str]:
+        return [
+            "date_folder",
+            "image",
+            "path",
+            "pixels_per_um",
+            "min_area_px",
+            "max_area_px",
+            "threshold_bias",
+            "total_detected",
+            "Detected",
+        ]
+
+    def detect_path_with_settings(
+        self,
+        path: Path,
+        min_area_value: float,
+        max_area_value: float,
+        threshold_bias: float,
+        use_physical_area: bool = False,
+        target_size_nm: str = "",
+        size_range_factor: str = "",
+    ) -> tuple[np.ndarray, list[OrigamiObject], dict[str, str | int]]:
+        rgb = load_rgb(path)
+        scale_info = self.current_scale_info(rgb, path)
+        min_area, max_area = self.detection_area_bounds(
+            scale_info,
+            min_area_value,
+            max_area_value,
+            use_physical_area,
+            target_size_nm=target_size_nm,
+            size_range_factor=size_range_factor,
+        )
+        objects = detect_origami(rgb, min_area, max_area, threshold_bias, scale_info.pixels_per_um)
+        row: dict[str, str | int] = {
+            "date_folder": path.parent.name,
+            "image": path.name,
+            "path": str(path),
+            "pixels_per_um": f"{scale_info.pixels_per_um:.6g}",
+            "min_area_px": min_area,
+            "max_area_px": max_area,
+            "threshold_bias": f"{threshold_bias:.6g}",
+            "total_detected": len(objects),
+            "Detected": len(objects),
+        }
+        return rgb, objects, row
+
+    def detect_path_counts_row(self, path: Path) -> dict[str, str | int]:
+        _rgb, _objects, row = self.detect_path_with_settings(
+            path,
+            float(self.min_area.get()),
+            float(self.max_area.get()),
+            float(self.threshold_bias.get()),
+            use_physical_area=True,
+            target_size_nm=self.target_size_nm.get(),
+            size_range_factor=self.size_range_factor.get(),
+        )
+        return row
+
+    def write_detect_all_summary(self, output_dir: Path, rows: list[dict[str, str | int]]) -> None:
+        with (output_dir / DETECT_COUNTS_FILE).open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.detect_count_fieldnames())
+            writer.writeheader()
+            writer.writerows(rows)
+        with (output_dir / "all_image_counts.csv").open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.detect_count_fieldnames())
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def write_detect_image_result_folder(self, path: Path, rgb: np.ndarray, objects: list[OrigamiObject], row: dict[str, str | int], parent_dir: Path) -> Path:
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem)
+        output_dir = parent_dir / stem
+        suffix = 2
+        while output_dir.exists():
+            output_dir = parent_dir / f"{stem}_{suffix}"
+            suffix += 1
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        with (output_dir / f"{stem}_counts.csv").open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.detect_count_fieldnames())
+            writer.writeheader()
+            writer.writerow(row)
+        Image.fromarray(rgb).save(output_dir / path.name)
+        detected_image = self.annotated_image(rgb, objects)
+        detected_image.save(output_dir / f"{stem}_detected.png")
+        detected_image.save(output_dir / f"{stem}_annotated.png")
+        return output_dir
+
+    def detect_all_images(self) -> None:
+        if not self.images:
+            messagebox.showwarning("No images", "Open a root folder with images first.")
+            return
+        self.start_detect_export_review()
+
+    def start_detect_export_review(self) -> None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.detect_review_output_dir = self.output_dir / CURRENT_RESULTS_DIR / f"detect_all_images_{timestamp}"
+        self.detect_review_output_dir.mkdir(parents=True, exist_ok=True)
+        self.detect_review_index = 0
+        self.detect_review_rows: list[dict[str, str | int]] = []
+        self.detect_review_skipped: list[Path] = []
+        self.detect_review_current: tuple[np.ndarray, list[OrigamiObject], dict[str, str | int]] | None = None
+        self.detect_review_photo: ImageTk.PhotoImage | None = None
+
+        window = Toplevel(self.root)
+        self.detect_review_window = window
+        window.title("Inspect Detect + Export")
+        window.geometry("1200x850")
+
+        toolbar = Frame(window)
+        toolbar.pack(fill="x", padx=8, pady=8)
+        Label(toolbar, text="Min pixel area").pack(side=LEFT)
+        self.detect_review_min_area = StringVar(value=self.min_area.get())
+        Entry(toolbar, textvariable=self.detect_review_min_area, width=8).pack(side=LEFT, padx=(4, 8))
+        Label(toolbar, text="Max pixel area").pack(side=LEFT)
+        self.detect_review_max_area = StringVar(value=self.max_area.get())
+        Entry(toolbar, textvariable=self.detect_review_max_area, width=8).pack(side=LEFT, padx=(4, 8))
+        Label(toolbar, text="Target nm").pack(side=LEFT)
+        self.detect_review_target_size_nm = StringVar(value=self.target_size_nm.get())
+        Entry(toolbar, textvariable=self.detect_review_target_size_nm, width=9).pack(side=LEFT, padx=(4, 8))
+        Label(toolbar, text="Size range multiple").pack(side=LEFT)
+        self.detect_review_size_range = StringVar(value=self.size_range_factor.get())
+        Entry(toolbar, textvariable=self.detect_review_size_range, width=8).pack(side=LEFT, padx=(4, 8))
+        Label(toolbar, text="Bias").pack(side=LEFT)
+        self.detect_review_bias = StringVar(value=self.threshold_bias.get())
+        Entry(toolbar, textvariable=self.detect_review_bias, width=8).pack(side=LEFT, padx=(4, 8))
+        Button(toolbar, text="Rerun", command=self.rerun_detect_review_current).pack(side=LEFT)
+        Button(toolbar, text="Save + Next", command=self.save_detect_review_current).pack(side=LEFT, padx=8)
+        Button(toolbar, text="Skip Image", command=self.skip_detect_review_current).pack(side=LEFT)
+        Button(toolbar, text="Finish", command=self.finish_detect_review).pack(side=LEFT, padx=8)
+        self.detect_review_status = StringVar(value="")
+        Label(toolbar, textvariable=self.detect_review_status).pack(side=LEFT, padx=12)
+
+        frame = Frame(window)
+        frame.pack(fill=BOTH, expand=True, padx=8, pady=(0, 8))
+        self.detect_review_canvas = Canvas(frame, background="#f0f0f0", highlightthickness=0)
+        y_scroll = Scrollbar(frame, orient="vertical", command=self.detect_review_canvas.yview)
+        x_scroll = Scrollbar(frame, orient="horizontal", command=self.detect_review_canvas.xview)
+        self.detect_review_canvas.configure(xscrollcommand=x_scroll.set, yscrollcommand=y_scroll.set)
+        self.detect_review_canvas.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        window.bind("<Return>", lambda _event: self.save_detect_review_current())
+        window.bind("<space>", lambda _event: self.rerun_detect_review_current())
+        window.bind("<Delete>", lambda _event: self.skip_detect_review_current())
+        window.protocol("WM_DELETE_WINDOW", self.finish_detect_review)
+        self.load_detect_review_current()
+
+    def load_detect_review_current(self) -> None:
+        if self.detect_review_index >= len(self.images):
+            self.finish_detect_review()
+            return
+        path = self.images[self.detect_review_index]
+        self.detect_review_status.set(f"Detecting {self.detect_review_index + 1}/{len(self.images)}: {path.name}")
+        self.detect_review_window.update_idletasks()
+        self.rerun_detect_review_current()
+
+    def rerun_detect_review_current(self) -> None:
+        if self.detect_review_index >= len(self.images):
+            return
+        path = self.images[self.detect_review_index]
+        try:
+            rgb, objects, row = self.detect_path_with_settings(
+                path,
+                float(self.detect_review_min_area.get()),
+                float(self.detect_review_max_area.get()),
+                float(self.detect_review_bias.get()),
+                use_physical_area=False,
+                target_size_nm=self.detect_review_target_size_nm.get(),
+                size_range_factor=self.detect_review_size_range.get(),
+            )
+        except Exception as exc:
+            messagebox.showerror("Detection failed", f"{exc}\n\n{traceback.format_exc()}")
+            return
+        self.detect_review_current = (rgb, objects, row)
+        preview = self.annotated_image(rgb, objects)
+        self.detect_review_photo = ImageTk.PhotoImage(preview)
+        self.detect_review_canvas.delete("all")
+        self.detect_review_canvas.create_image(0, 0, image=self.detect_review_photo, anchor="nw")
+        self.detect_review_canvas.configure(scrollregion=(0, 0, preview.width, preview.height))
+        self.detect_review_status.set(f"{self.detect_review_index + 1}/{len(self.images)}  {path.name}  detected: {row['total_detected']}")
+
+    def save_detect_review_current(self) -> None:
+        if self.detect_review_current is None:
+            return
+        path = self.images[self.detect_review_index]
+        rgb, objects, row = self.detect_review_current
+        self.write_detect_image_result_folder(path, rgb, objects, row, self.detect_review_output_dir)
+        self.detect_review_rows.append(row)
+        self.detect_review_index += 1
+        self.detect_review_current = None
+        self.load_detect_review_current()
+
+    def skip_detect_review_current(self) -> None:
+        if self.detect_review_index < len(self.images):
+            self.detect_review_skipped.append(self.images[self.detect_review_index])
+            self.detect_review_index += 1
+            self.detect_review_current = None
+            self.load_detect_review_current()
+
+    def finish_detect_review(self) -> None:
+        if not hasattr(self, "detect_review_output_dir"):
+            return
+        self.write_detect_all_summary(self.detect_review_output_dir, self.detect_review_rows)
+        if hasattr(self, "detect_review_window") and self.detect_review_window.winfo_exists():
+            self.detect_review_window.destroy()
+        total = sum(int(row["total_detected"]) for row in self.detect_review_rows)
+        self.status.set(f"Reviewed detection export saved {len(self.detect_review_rows)} image(s), skipped {len(self.detect_review_skipped)}.")
+        messagebox.showinfo(
+            "Detect/export complete",
+            f"Saved reviewed detection export to:\n{self.detect_review_output_dir}\n\nSaved: {len(self.detect_review_rows)}\nSkipped: {len(self.detect_review_skipped)}\nTotal detected: {total}",
+        )
 
     def batch_count(self) -> None:
         if self.model is None:

@@ -1,6 +1,6 @@
 # DNA origami AFM counting GUI
 
-This folder now includes an interactive desktop tool for labeling DNA origami states, training a classifier, and batch-counting the number of origami in each AFM PNG image.
+This folder now includes an interactive desktop tool for labeling DNA origami states, training a classifier, and batch-counting the number of origami in AFM image files.
 
 ## Setup
 
@@ -39,20 +39,36 @@ Double-click `run_origami_counter.bat`, or run:
 ## Workflow
 
 1. Click **Open Root** and choose the folder that contains your dated folders.
-2. Select an `origami...png` image from the list.
+2. Select an AFM image from the list. File names do not need to start with `origami`; supported rendered image formats are PNG, JPG, JPEG, TIF, and TIFF.
 3. Check the scale status for the selected image. When the matching `.spm` file is present, calibration uses the `.spm` scan size metadata, not the PNG scale bar.
 4. Optional fallback: click **Box Scale** and drag across the printed scale bar only if an image does not have a usable matching `.spm` file.
-5. Click **Box Area**, drag a box around one representative origami, and release. This sets the physical area range automatically and runs detection.
-6. Click **Detect** again if you adjust the area, threshold, or scale setting.
+5. Click **Box Pixel Area**, drag a box around one representative origami, and release. This sets the pixel-area detection range automatically and runs detection.
+6. Click **Detect** again if you adjust the pixel area, threshold, or scale setting.
 7. Add or edit state names in the state panel.
 8. Select a state, then click detected origami boxes in the image to label examples.
 9. Click **Add Current Image Labels to Training Data** when you want the current labels to be used for training.
 10. Click **Train Current Image** to train only from the selected image's committed training labels, or **Train All Labeled Images** to train from every image in the training data list.
 11. Click **Classify Image** to count the current image, or **Batch Count** to process all images.
 
+Click **Detect + Export All Images** if you only want particle counts and do not need state classification. This opens a review window for every image, lets you rerun detection with adjusted pixel-area/bias settings, and lets you save or skip each image. Approved detections are saved with original images, `*_detected.png` annotated detection images, and count CSVs under `analysis_output/classified_images/detect_all_images_<timestamp>/`.
+
+Instead of entering pixel-area limits directly, you can enter a physical target size in **Target size nm**, such as `100x150`. The app converts that size to area using each image's scale metadata and applies the **Size range multiple**, for example `0.35-3.0`, to compute per-image pixel-area limits.
+
+The detection size fields synchronize when you press Enter or leave a field. Editing **Target size nm** or **Size range multiple** updates the min/max pixel area fields. Editing min/max pixel area updates **Target size nm** as a square-equivalent size, because an area alone cannot determine separate width and height.
+
 The classifier uses scale-normalized size features from the `.spm` scan size when available, so labels from one zoom level can be applied to any other zoom level.
 
-If your images are still raw Nanoscope `.spm` files, click **Import SPM Folder** and choose the folder containing them. The app reads the height channel, applies plane and line flattening, writes colored flattened PNGs using NanoScope Color Table 12 with a z-height colorbar and scale bar to `analysis_output/spm_png_<timestamp>/`, copies each source `.spm` beside its PNG for scan-size metadata, and loads the converted PNG folder for classification.
+## Polymer persistence length
+
+For polymer-like origami contours, open a folder such as `polymer_example`, switch to the **Polymers** tab, select the AFM image, and use **Analyze Polymers**. The analysis follows the AFM contour workflow described by Lee et al., ACS Nano 2019: threshold the height image, skeletonize unbranched contours, sample each contour at a fixed segment length, and fit the 2D worm-like-chain mean-square end-to-end relation
+
+```text
+<R^2> = 4 Lp lc [1 - (2 Lp / lc) (1 - exp(-lc / (2 Lp)))]
+```
+
+Use **Min length nm** to reject short debris and **Segment nm** to set the contour sampling interval. The tab can preview the original image, transparent contour overlay, or contours only; adjust **Overlay opacity** to make the detected traces lighter or stronger. It also shows a plot of measured mean-square end-to-end distance against contour separation with the fitted 2D WLC curve used to calculate persistence length. The main polymer view is dynamic: **Show Contours + Fit** displays draggable contour and WLC-fit panes, while **Preview Figure 2b Plot** or **Preview Figure C Plot** switches the right side to a full-height figure preview. Figure 2b shows the AFM image plus detected contours and the same contours translated to a common origin with initial tangents aligned horizontally. Figure C renders paired tiles where each accepted polymer has a cropped AFM image next to its extracted contour. Scale calibration comes from the paired `.spm` scan-size metadata when available; otherwise use **Box Scale** first. **Export Polymer Results** writes a summary CSV, per-contour CSV, mean-square end-to-end CSV, original image, annotated contour image, WLC fit plot, Figure 2b-style contour plot, and Figure C-style crop/contour plot under `analysis_output/polymer_persistence/`.
+
+If your images are still raw Nanoscope `.spm` files, click **Import SPM Folder** and choose the folder containing them. Raw `.spm` file names do not need to start with `origami`. The app reads the height channel, applies plane and line flattening, and opens a per-image import preview where you can tune the z-height display range for each image. Click **Import Current + Next** only after the current image looks right; the app writes that image immediately, then advances to the next one. Click **Skip File** for images that should not be imported. Converted PNGs use NanoScope Color Table 12 with a z-height colorbar and scale bar, are saved to `converted_images/spm_png_<timestamp>/`, and keep each source `.spm` beside its PNG for scan-size metadata. The importer ignores existing `analysis_output/` and `converted_images/` folders, so previous imports are not previewed again as duplicate raw files. The default z range is based on the inner quartile, so isolated high spots can saturate without darkening the entire image.
 
 The **Training Data Images** panel shows every image that has been explicitly added to training data and the number of committed labels for that image. Double-click a row, or select it and click **Open**, to jump to that image. Select a row and click **Clear** to remove that image from the training data list.
 
