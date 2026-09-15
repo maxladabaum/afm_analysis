@@ -50,6 +50,10 @@ class PooledPolymerTests(unittest.TestCase):
         self.assertEqual([row['pooled_id'] for row in result.contours], [1, 2])
         self.assertEqual([row['accepted_contours'] for row in result.images], [1, 1])
         self.assertTrue(math.isfinite(result.analysis.persistence_nm))
+        aligned = app.pooled_aligned_contours(result)
+        self.assertEqual(len(aligned), 2)
+        np.testing.assert_allclose(aligned[0][1], aligned[1][1])
+        np.testing.assert_allclose(aligned[0][1][0], [0, 0])
 
     def test_uncalibrated_images_are_reported_and_exported(self):
         result, _ = self.run_pool(missing=True)
@@ -59,7 +63,12 @@ class PooledPolymerTests(unittest.TestCase):
             output = Path(directory)
             plot = app.OrigamiCounterApp.polymer_fit_plot_image(None, result.analysis, pooled=True)
             app.export_pooled_polymers(result, plot, output)
-            self.assertEqual(len(list(output.iterdir())), 5)
+            self.assertEqual(len(list(output.iterdir())), 7)
+            with (output / 'pooled_figure_2b_coordinates.csv').open() as handle:
+                coordinates = list(csv.DictReader(handle))
+            self.assertEqual({row['image_id'] for row in coordinates}, {'1', '2'})
+            self.assertEqual({row['pooled_id'] for row in coordinates}, {'1', '2'})
+            self.assertTrue((output / 'pooled_figure_2b_aligned.png').exists())
             with (output / 'pooled_msd.csv').open() as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(rows[0]['polymer_ids'], '1;2')

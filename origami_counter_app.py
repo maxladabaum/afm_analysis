@@ -1166,6 +1166,7 @@ def analyze_pooled_polymers(
 def export_pooled_polymers(result: PooledPolymerResult, plot: Image.Image, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     plot.save(output_dir / "pooled_wlc_fit.png")
+    export_pooled_figure_2b(result, output_dir)
     tables = {
         "images.csv": (result.images, list(dict.fromkeys(key for row in result.images for key in row))),
         "contours.csv": (result.contours, ["pooled_id", "image_id", "path", "object_id", "length_nm", "end_to_end_nm", "excluded_reason", "endpoint_count", "branchpoint_pixels", "path_valid", "pruned_branches"]),
@@ -1267,6 +1268,62 @@ def polymer_figure_2b_image(
     plt.close(fig)
     buffer.seek(0)
     return Image.open(buffer).convert("RGB")
+
+
+def pooled_aligned_contours(result: PooledPolymerResult) -> list[tuple[PolymerObject, np.ndarray]]:
+    # Pooled points are already in nm, equivalent to 1000 pixels per micron.
+    segment_nm = result.analysis.params[1]
+    return [(polymer, aligned_polymer_contour_points(polymer, 1000, segment_nm))
+            for polymer in result.analysis.objects if not polymer.excluded_reason and len(polymer.points) >= 2]
+
+
+def pooled_figure_2b_image(result: PooledPolymerResult) -> Image.Image:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    contours = pooled_aligned_contours(result)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for _, points in contours:
+        ax.plot(points[:, 0], points[:, 1], color="#777777", linewidth=1.0, alpha=0.55)
+    if contours:
+        points = np.concatenate([points for _, points in contours])
+        min_x, min_y = points.min(axis=0)
+        max_x, max_y = points.max(axis=0)
+        margin = max(20, (max_y - min_y) * 0.15)
+        ax.set_xlim(min(-20, min_x - 20), max(120, max_x + 20))
+        ax.set_ylim(max_y + margin, min_y - margin)
+        ax.plot([0, 100], [0, 0], color="#111111", linewidth=3, solid_capstyle="butt")
+        ax.text(0, -12, "100 nm", fontsize=9, va="top")
+    else:
+        ax.text(0.5, 0.5, "No accepted contours to align.", ha="center", transform=ax.transAxes)
+    ax.axhline(0, color="#dddddd", linewidth=0.8, zorder=0)
+    ax.axvline(0, color="#dddddd", linewidth=0.8, zorder=0)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x after tangent alignment (nm)")
+    ax.set_ylabel("y (nm)")
+    images = sum(row["accepted_contours"] > 0 for row in result.images)
+    ax.set_title(f"Pooled Figure 2b: aligned contours\n{len(contours)} contours from {images} images")
+    ax.grid(alpha=0.18)
+    fig.tight_layout()
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return Image.open(buffer).convert("RGB")
+
+
+def export_pooled_figure_2b(result: PooledPolymerResult, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pooled_figure_2b_image(result).save(output_dir / "pooled_figure_2b_aligned.png")
+    sources = {row["pooled_id"]: row for row in result.contours if row["pooled_id"] != ""}
+    with (output_dir / "pooled_figure_2b_coordinates.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["pooled_id", "image_id", "path", "object_id", "point_index", "aligned_x_nm", "aligned_y_nm"])
+        for polymer, points in pooled_aligned_contours(result):
+            source = sources[polymer.object_id]
+            for index, (x, y) in enumerate(points):
+                writer.writerow([polymer.object_id, source["image_id"], source["path"], source["object_id"], index, float(x), float(y)])
 
 
 def polymer_crop_bounds(
@@ -3139,7 +3196,10 @@ class OrigamiCounterApp:
         window.title("Pooled Polymer Analysis")
         window.geometry("1000x780")
         Label(window, text=result.analysis.status_text, wraplength=950).pack(padx=12, pady=(12, 4))
-        Label(window, text="All images in the folder list • Pair-weighted mean • Error bars: ±1 SD").pack(pady=4)
+        description = StringVar(master=window, value="All images in the folder list • Pair-weighted mean • Error bars: ±1 SD")
+        Label(window, textvariable=description).pack(pady=4)
+        active_plot = [plot]
+        aligned_plot = [None]
         # Capture the output location now so switching folders won't redirect export.
         base_output = self.output_dir / "polymer_persistence"
 
@@ -3151,7 +3211,36 @@ class OrigamiCounterApp:
             except Exception as exc:
                 messagebox.showerror("Export failed", str(exc), parent=window)
 
-        Button(window, text="Export Pooled Results", command=export).pack(pady=6)
+        actions = Frame(window)
+        actions.pack(fill="x", padx=12, pady=6)
+        Button(actions, text="Export Pooled Results", command=export).pack(side=LEFT)
+
+        def show_aligned():
+            try:
+                if aligned_plot[0] is None:
+                    aligned_plot[0] = pooled_figure_2b_image(result)
+                active_plot[0] = aligned_plot[0]
+                description.set("All accepted contours • Common origin and initial-tangent alignment • Distances in nm")
+                canvas.preview_zoom.reset()
+            except Exception as exc:
+                messagebox.showerror("Pooled Figure 2b failed", str(exc), parent=window)
+
+        def show_fit():
+            active_plot[0] = plot
+            description.set("All images in the folder list • Pair-weighted mean • Error bars: ±1 SD")
+            canvas.preview_zoom.reset()
+
+        def export_aligned():
+            directory = base_output / f"pooled_figure_2b_{datetime.now():%Y%m%d_%H%M%S_%f}"
+            try:
+                export_pooled_figure_2b(result, directory)
+                messagebox.showinfo("Pooled Figure 2b exported", f"Saved aligned plot and coordinates to:\n{directory}", parent=window)
+            except Exception as exc:
+                messagebox.showerror("Export failed", str(exc), parent=window)
+
+        Button(actions, text="Preview Pooled Figure 2b", command=show_aligned).pack(side=LEFT, padx=6)
+        Button(actions, text="Show Persistence Fit", command=show_fit).pack(side=LEFT)
+        Button(actions, text="Export Pooled Figure 2b", command=export_aligned).pack(side=LEFT, padx=6)
         details = ttk.Treeview(window, columns=("image", "count", "qc", "status"), show="headings", height=5)
         for column, title, width in (("image", "Image", 220), ("count", "Accepted", 70),
                                     ("qc", "Candidates / boundary / topology / short / long", 340), ("status", "Status / skip reason", 300)):
@@ -3169,7 +3258,7 @@ class OrigamiCounterApp:
         canvas.pack(fill=BOTH, expand=True, padx=12, pady=12)
 
         def draw(_event=None) -> None:
-            preview = zoomed_preview(plot, canvas)
+            preview = zoomed_preview(active_plot[0], canvas)
             canvas.photo = ImageTk.PhotoImage(preview)
             canvas.delete("all")
             cw, ch = max(100, canvas.winfo_width()), max(100, canvas.winfo_height())
