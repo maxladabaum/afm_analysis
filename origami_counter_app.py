@@ -5,21 +5,25 @@ import csv
 import io
 import json
 import math
+import queue
 import re
 import shutil
+import threading
 import traceback
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, TOP, Button, Canvas, Entry, Frame, Label, Listbox, Menu, Scrollbar, StringVar, Tk, Toplevel, filedialog, messagebox, simpledialog, ttk
 
 import joblib
 import numpy as np
-from PIL import Image, ImageDraw, ImageTk
-from skimage import color, exposure, filters, measure, morphology, transform
+from PIL import Image, ImageDraw, ImageFont, ImageTk
+from skimage import color, exposure, filters, measure, morphology, segmentation, transform
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from tk_startup import create_tk_root
 
 
 APP_TITLE = "DNA Origami AFM Counter"
@@ -51,6 +55,72 @@ STATE_COLORS = [
 ]
 
 
+class PreviewZoom:
+    """Shared zoom and drag navigation for raster plot previews."""
+
+    def __init__(self, canvas: Canvas, redraw: Callable, parent, before=None):
+        self.canvas = canvas
+        self.redraw = redraw
+        self.factor = 1.0
+        canvas.preview_zoom = self
+        toolbar = Frame(parent)
+        toolbar.pack(fill="x", before=before, padx=6, pady=(3, 0))
+        Button(toolbar, text="Zoom −", command=lambda: self.adjust(0.8)).pack(side=LEFT)
+        Button(toolbar, text="Fit", command=self.reset).pack(side=LEFT, padx=4)
+        Button(toolbar, text="Zoom +", command=lambda: self.adjust(1.25)).pack(side=LEFT)
+        self.label = StringVar(master=canvas, value="100% of fit")
+        Label(toolbar, textvariable=self.label).pack(side=LEFT, padx=8)
+        Label(toolbar, text="Scroll to zoom · drag to pan").pack(side=LEFT, padx=6)
+        canvas.bind("<MouseWheel>", self.wheel)
+        canvas.bind("<Button-4>", lambda event: self.adjust(1.25, event.x, event.y))
+        canvas.bind("<Button-5>", lambda event: self.adjust(0.8, event.x, event.y))
+        canvas.bind("<ButtonPress-1>", self.start_pan)
+        canvas.bind("<B1-Motion>", lambda event: canvas.scan_dragto(event.x, event.y, gain=1))
+        canvas.bind("<Double-Button-1>", lambda _event: self.reset())
+
+    def start_pan(self, event):
+        if "qc_details" not in self.canvas.gettags("current"):
+            self.canvas.scan_mark(event.x, event.y)
+
+    def wheel(self, event):
+        if event.delta:
+            self.adjust(1.25 if event.delta > 0 else 0.8, event.x, event.y)
+        return "break"
+
+    def adjust(self, factor, x=None, y=None):
+        canvas = self.canvas
+        x = canvas.winfo_width() / 2 if x is None else x
+        y = canvas.winfo_height() / 2 if y is None else y
+        region = tuple(map(float, canvas.cget("scrollregion").split()))
+        old_w, old_h = region[2:] if len(region) == 4 else (canvas.winfo_width(), canvas.winfo_height())
+        anchor_x = canvas.canvasx(x) / max(1, old_w)
+        anchor_y = canvas.canvasy(y) / max(1, old_h)
+        self.factor = max(0.25, min(8.0, self.factor * factor))
+        self.label.set(f"{self.factor:.0%} of fit")
+        self.redraw()
+        region = tuple(map(float, canvas.cget("scrollregion").split()))
+        if len(region) == 4:
+            canvas.xview_moveto(anchor_x - x / max(1, region[2]))
+            canvas.yview_moveto(anchor_y - y / max(1, region[3]))
+        return "break"
+
+    def reset(self):
+        self.factor = 1.0
+        self.label.set("100% of fit")
+        self.canvas.xview_moveto(0)
+        self.canvas.yview_moveto(0)
+        self.redraw()
+        return "break"
+
+
+def zoomed_preview(image: Image.Image, canvas: Canvas) -> Image.Image:
+    cw, ch = max(100, canvas.winfo_width()), max(100, canvas.winfo_height())
+    fit = min(cw / image.width, ch / image.height, 1.0)
+    factor = getattr(getattr(canvas, "preview_zoom", None), "factor", 1.0)
+    scale = min(fit * factor, math.sqrt(20_000_000 / (image.width * image.height)))
+    return image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), Image.Resampling.LANCZOS)
+
+
 @dataclass
 class OrigamiObject:
     object_id: int
@@ -71,18 +141,23 @@ class PolymerObject:
     end_to_end_nm: float
     segment_count: int
     excluded_reason: str = ""
+    endpoint_count: int = 2
+    branchpoint_pixels: int = 0
+    path_valid: bool = True
+    pruned_branches: int = 0
 
 
 @dataclass
 class PolymerAnalysisResult:
-    params: tuple[float, float, float]
+    params: tuple[float, float, float, float, float]
     objects: list[PolymerObject]
-    msd_rows: list[dict[str, float]]
+    msd_rows: list[dict[str, float | str]]
     persistence_nm: float | None
     fit_r2: float | None
     status_text: str
     figure_2b_image: Image.Image | None = None
     figure_c_image: Image.Image | None = None
+    qc: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -92,6 +167,13 @@ class ScaleInfo:
     bar_um: float
     detected: bool
     source: str = "auto"
+
+
+@dataclass
+class PooledPolymerResult:
+    analysis: PolymerAnalysisResult
+    images: list[dict]
+    contours: list[dict]
 
 
 @dataclass
@@ -650,6 +732,45 @@ def detect_origami(rgb: np.ndarray, min_area: int, max_area: int, threshold_bias
     return objects
 
 
+def draw_polymer_trace(draw: ImageDraw.ImageDraw, polymer: PolymerObject, fill, width: int) -> None:
+    if polymer.path_valid:
+        draw.line(polymer.points, fill=fill, width=width)
+    else:
+        # These are unordered skeleton pixels, not a polyline. Connecting them
+        # produces artificial diagonals and filled-looking regions in overlays.
+        radius = width / 2
+        for x, y in polymer.points:
+            draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=fill)
+
+
+def draw_polymer_failure_labels(draw: ImageDraw.ImageDraw, polymers: list[PolymerObject], size: tuple[int, int], font_size: int = 11) -> None:
+    font = ImageFont.load_default(size=font_size)
+    reasons = {
+        "touches_scan_boundary": "Image edge",
+        "shorter_than_min_length": "Too short",
+        "longer_than_max_length": "Too long",
+    }
+    for polymer in polymers:
+        if not polymer.excluded_reason or not polymer.points:
+            continue
+        reason = reasons.get(polymer.excluded_reason, "Invalid path")
+        if polymer.excluded_reason == "branched_or_incomplete_skeleton":
+            reason = "Branching" if polymer.branchpoint_pixels else "Invalid path"
+        label = f"{polymer.object_id}: {reason}"
+        points = np.asarray(polymer.points)
+        # Use an actual skeleton point near the center, including unordered paths.
+        center = points.mean(axis=0)
+        x, y = points[np.argmin(np.sum((points - center) ** 2, axis=1))]
+        left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
+        padding = max(3, font_size // 4)
+        width, height = right - left + 2 * padding, bottom - top + 2 * padding
+        x = max(0, min(float(x) - width / 2, size[0] - width))
+        y = max(0, min(float(y) - height / 2, size[1] - height))
+        draw.rounded_rectangle((x, y, x + width, y + height), radius=padding,
+                               fill=(255, 240, 240), outline=(160, 25, 35))
+        draw.text((x + padding - left, y + padding - top), label, font=font, fill=(135, 10, 25))
+
+
 def ordered_skeleton_path(mask: np.ndarray) -> list[tuple[int, int]] | None:
     coords = [tuple(map(int, coord)) for coord in np.argwhere(mask)]
     if len(coords) < 2:
@@ -738,10 +859,11 @@ def fit_persistence_length_2d(contour_separations_nm: np.ndarray, mean_square_nm
     return best, r2
 
 
-def polymer_msd_table(polymers: list[PolymerObject], pixels_per_um: float, segment_nm: float) -> list[dict[str, float]]:
+def polymer_msd_table(polymers: list[PolymerObject], pixels_per_um: float, segment_nm: float) -> list[dict[str, float | str]]:
     px_per_nm = pixels_per_um / 1000.0
     spacing_px = max(segment_nm * px_per_nm, 1e-6)
     buckets: dict[int, list[float]] = {}
+    contributors: dict[int, list[int]] = {}
     for polymer in polymers:
         if polymer.excluded_reason:
             continue
@@ -753,7 +875,8 @@ def polymer_msd_table(polymers: list[PolymerObject], pixels_per_um: float, segme
             distances_nm2 = (np.sum(deltas * deltas, axis=1) / (px_per_nm * px_per_nm))
             if distances_nm2.size:
                 buckets.setdefault(lag, []).extend(float(v) for v in distances_nm2)
-    rows: list[dict[str, float]] = []
+                contributors.setdefault(lag, []).append(polymer.object_id)
+    rows: list[dict[str, float | str]] = []
     for lag in sorted(buckets):
         values = np.asarray(buckets[lag], dtype=np.float64)
         if values.size < 2:
@@ -762,10 +885,62 @@ def polymer_msd_table(polymers: list[PolymerObject], pixels_per_um: float, segme
             {
                 "contour_separation_nm": lag * segment_nm,
                 "mean_square_end_to_end_nm2": float(values.mean()),
+                # Descriptive spread of pooled pairs, not uncertainty in the mean:
+                # overlapping pairs from one polymer are correlated.
+                "std_dev_end_to_end_squared_nm2": float(values.std(ddof=1)),
                 "sample_count": float(values.size),
+                "polymer_count": float(len(contributors[lag])),
+                "polymer_ids": ";".join(str(object_id) for object_id in contributors[lag]),
             }
         )
     return rows
+
+
+def prune_short_skeleton_branches(mask: np.ndarray, max_length_px: float) -> tuple[np.ndarray, int]:
+    """Remove the shortest endpoint-to-junction spur, never an entire open path."""
+    cleaned = mask.copy()
+    pruned = 0
+    if max_length_px <= 0:
+        return cleaned, pruned
+    while True:
+        coords = {tuple(map(int, point)) for point in np.argwhere(cleaned)}
+        neighbors = {point: [candidate for dr in (-1, 0, 1) for dc in (-1, 0, 1)
+                              if (dr, dc) != (0, 0)
+                              if (candidate := (point[0] + dr, point[1] + dc)) in coords]
+                     for point in coords}
+        endpoints = sorted(point for point in coords if len(neighbors[point]) == 1)
+        if len(endpoints) < 3:
+            break
+        candidates = []
+        for start in endpoints:
+            trail = [start]
+            previous = None
+            current = start
+            distance = 0.0
+            while True:
+                options = [point for point in neighbors[current] if point != previous]
+                if len(options) != 1:
+                    break
+                following = options[0]
+                distance += math.hypot(following[0] - current[0], following[1] - current[1])
+                if distance > max_length_px:
+                    break
+                if len(neighbors[following]) > 2:
+                    candidates.append((distance, trail))
+                    break
+                if len(neighbors[following]) == 1:
+                    break
+                trail.append(following)
+                previous, current = current, following
+        if not candidates:
+            break
+        _, shortest = min(candidates, key=lambda candidate: (candidate[0], candidate[1]))
+        for point in shortest:
+            cleaned[point] = False
+        # Resolve the redundant junction pixels left behind by the removed spur.
+        cleaned = morphology.skeletonize(cleaned)
+        pruned += 1
+    return cleaned, pruned
 
 
 def detect_polymer_contours(
@@ -773,6 +948,9 @@ def detect_polymer_contours(
     pixels_per_um: float,
     min_length_nm: float,
     threshold_bias: float = 0.0,
+    max_length_nm: float = math.inf,
+    qc: dict | None = None,
+    branch_prune_nm: float = 0.0,
 ) -> list[PolymerObject]:
     scan_minr, scan_minc, scan_maxr, scan_maxc = scan_bbox(rgb)
     crop_rgb = rgb[scan_minr:scan_maxr, scan_minc:scan_maxc]
@@ -783,18 +961,46 @@ def detect_polymer_contours(
         threshold = filters.threshold_otsu(smooth)
     except ValueError:
         threshold = float(smooth.mean())
-    binary = smooth > min(1.0, threshold + threshold_bias)
+    cutoff = min(1.0, threshold + threshold_bias)
+    polarity = "bright"
+    binary = smooth > cutoff
     if binary.mean() > 0.35:
-        binary = smooth < max(0.0, threshold - threshold_bias)
+        cutoff = max(0.0, threshold - threshold_bias)
+        polarity = "dark"
+        binary = smooth < cutoff
+    foreground_percent = float(binary.mean() * 100)
+    raw_components = int(measure.label(binary).max())
     binary = remove_small_objects_compat(binary, 24)
+    removed_components = raw_components - int(measure.label(binary).max())
     binary = morphology.closing(binary, morphology.disk(1))
+    # Identify boundary-connected foreground before thinning: skeletonization
+    # can move a frame or clipped polymer inward, hiding its edge contact.
+    interior = segmentation.clear_border(binary, buffer_size=2)
+    boundary_foreground = binary & ~interior
     skeleton = morphology.skeletonize(binary)
     labels = measure.label(skeleton)
     objects: list[PolymerObject] = []
     min_length_px = min_length_nm * pixels_per_um / 1000.0
     for prop in measure.regionprops(labels):
         component_mask = labels[prop.slice] == prop.label
+        touches_boundary = bool(np.any(boundary_foreground[prop.slice][component_mask]))
         path_rc = ordered_skeleton_path(component_mask)
+        pruned = 0
+        if path_rc is None and branch_prune_nm > 0 and not touches_boundary:
+            component_mask, pruned = prune_short_skeleton_branches(
+                component_mask, branch_prune_nm * pixels_per_um * analysis_scale / 1000,
+            )
+            path_rc = ordered_skeleton_path(component_mask)
+        path_valid = path_rc is not None
+        padded = np.pad(component_mask, 1)
+        neighbors = np.zeros_like(component_mask, dtype=np.uint8)
+        height, width = component_mask.shape
+        for dr in range(3):
+            for dc in range(3):
+                if (dr, dc) != (1, 1):
+                    neighbors += padded[dr:dr + height, dc:dc + width]
+        endpoints = int(np.count_nonzero(component_mask & (neighbors == 1)))
+        branches = int(np.count_nonzero(component_mask & (neighbors > 2)))
         reason = ""
         if path_rc is None:
             reason = "branched_or_incomplete_skeleton"
@@ -806,11 +1012,17 @@ def detect_polymer_contours(
             )
             for r, c in path_rc
         ]
-        length_px = path_length_px(points_xy)
+        # Unordered skeleton pixels do not define a contour length. Previously
+        # connecting them in row order could falsely label a branch as too long.
+        length_px = path_length_px(points_xy) if path_valid else math.nan
         if length_px < min_length_px:
             reason = "shorter_than_min_length"
-        end_to_end_px = 0.0
-        if len(points_xy) >= 2:
+        if length_px * 1000.0 / pixels_per_um > max_length_nm:
+            reason = "longer_than_max_length"
+        if touches_boundary:
+            reason = "touches_scan_boundary"
+        end_to_end_px = math.nan
+        if path_valid and len(points_xy) >= 2:
             first = np.asarray(points_xy[0])
             last = np.asarray(points_xy[-1])
             end_to_end_px = float(np.linalg.norm(last - first))
@@ -822,9 +1034,155 @@ def detect_polymer_contours(
                 end_to_end_nm=end_to_end_px * 1000.0 / pixels_per_um,
                 segment_count=max(0, len(points_xy) - 1),
                 excluded_reason=reason,
+                endpoint_count=endpoints,
+                branchpoint_pixels=branches,
+                path_valid=path_valid,
+                pruned_branches=pruned,
             )
         )
+    if qc is not None:
+        qc.update(
+            pixels_per_um=pixels_per_um, analysis_nm_per_pixel=1000 / (pixels_per_um * analysis_scale),
+            threshold_0_to_1=float(cutoff), polarity=polarity,
+            foreground_percent=foreground_percent, small_components_removed=removed_components,
+            candidate_components=len(objects), accepted_contours=sum(not obj.excluded_reason for obj in objects),
+            branch_prune_nm=branch_prune_nm, pruned_branches=sum(obj.pruned_branches for obj in objects),
+            rescued_contours=sum(obj.pruned_branches > 0 and not obj.excluded_reason for obj in objects),
+        )
+        qc["acceptance_percent"] = 100 * qc["accepted_contours"] / len(objects) if objects else 0.0
+        for reason in ("touches_scan_boundary", "branched_or_incomplete_skeleton", "shorter_than_min_length", "longer_than_max_length"):
+            qc[reason] = sum(obj.excluded_reason == reason for obj in objects)
     return objects
+
+
+def analyze_polymer_image(
+    rgb: np.ndarray,
+    pixels_per_um: float,
+    min_length_nm: float,
+    segment_nm: float,
+    bias: float,
+    progress: Callable[[float, str], None],
+    max_length_nm: float = math.inf,
+    branch_prune_nm: float = 0.0,
+) -> PolymerAnalysisResult:
+    """Compute results without accessing Tk widgets, safe to run in a worker."""
+    progress(25, "Detecting and skeletonizing polymer contours...")
+    qc = {}
+    objects = detect_polymer_contours(rgb, pixels_per_um, min_length_nm, bias, max_length_nm, qc=qc, branch_prune_nm=branch_prune_nm)
+    accepted = [obj for obj in objects if not obj.excluded_reason]
+    progress(65, "Calculating mean-square end-to-end distances...")
+    rows = polymer_msd_table(accepted, pixels_per_um, segment_nm)
+    persistence_nm = fit_r2 = None
+    if len(rows) >= 3:
+        progress(78, "Fitting 2D WLC persistence length...")
+        x = np.asarray([row["contour_separation_nm"] for row in rows], dtype=np.float64)
+        y = np.asarray([row["mean_square_end_to_end_nm2"] for row in rows], dtype=np.float64)
+        persistence_nm, fit_r2 = fit_persistence_length_2d(x, y)
+        fit_text = f"Lp {persistence_nm:.1f} nm, R^2 {fit_r2:.3f}"
+    else:
+        fit_text = "not enough contour data for fit"
+    excluded = len(objects) - len(accepted)
+    mean_length = float(np.mean([obj.length_nm for obj in accepted])) if accepted else 0.0
+    return PolymerAnalysisResult(
+        params=(min_length_nm, segment_nm, bias, max_length_nm, branch_prune_nm),
+        objects=objects,
+        msd_rows=rows,
+        persistence_nm=persistence_nm,
+        fit_r2=fit_r2,
+        status_text=(f"Accepted {len(accepted)} contours; excluded {excluded}.\n"
+                     f"Mean length {mean_length:.1f} nm; {fit_text}."),
+        qc=qc,
+    )
+
+
+def analyze_pooled_polymers(
+    paths: list[Path], calibrations: dict[str, dict[str, float]],
+    params: tuple[float, float, float, float, float], progress: Callable[[float, str], None],
+) -> PooledPolymerResult:
+    min_length, segment, bias, max_length, branch_prune_nm = params
+    pooled = []
+    image_rows = []
+    contour_rows = []
+    for index, path in enumerate(paths):
+        progress(90 * index / max(1, len(paths)), f"Image {index + 1}/{len(paths)}: {path.name}")
+        image_row = {"image_id": index + 1, "path": str(path), "status": "skipped",
+                     "reason": "", "pixels_per_um": "", "scale_source": "", "accepted_contours": 0}
+        image_rows.append(image_row)
+        try:
+            rgb = load_rgb(path)
+            scale = scale_info_from_spm(rgb, path)
+            if scale is not None:
+                pixels_per_um = scale.pixels_per_um
+                source = "spm"
+            else:
+                saved = calibrations.get(image_key(path), {})
+                pixels_per_um = float(saved.get("pixels_per_um", 0))
+                source = "saved"
+            if not math.isfinite(pixels_per_um) or pixels_per_um <= 0:
+                raise ValueError("No per-image calibration. Use Box Scale for this image first.")
+            qc = {}
+            objects = detect_polymer_contours(rgb, pixels_per_um, min_length, bias, max_length, qc=qc, branch_prune_nm=branch_prune_nm)
+            image_row.update(qc)
+            image_row["accepted_contours"] = 0
+            image_row.update(status="analyzed", pixels_per_um=pixels_per_um, scale_source=source)
+            for obj in objects:
+                pooled_id = ""
+                if not obj.excluded_reason:
+                    pooled_id = len(pooled) + 1
+                    # Normalize each image separately to nm before pooling pairs.
+                    points_nm = [(x * 1000 / pixels_per_um, y * 1000 / pixels_per_um) for x, y in obj.points]
+                    pooled.append(PolymerObject(pooled_id, points_nm, obj.length_nm, obj.end_to_end_nm, obj.segment_count))
+                    image_row["accepted_contours"] += 1
+                contour_rows.append({"pooled_id": pooled_id, "image_id": index + 1, "path": str(path),
+                                     "object_id": obj.object_id, "length_nm": obj.length_nm if obj.path_valid else "",
+                                     "end_to_end_nm": obj.end_to_end_nm if obj.path_valid else "", "excluded_reason": obj.excluded_reason})
+                contour_rows[-1].update(endpoint_count=obj.endpoint_count, branchpoint_pixels=obj.branchpoint_pixels,
+                                        path_valid=obj.path_valid, pruned_branches=obj.pruned_branches)
+        except Exception as exc:
+            image_row["reason"] = str(exc)
+    progress(92, "Pooling calibrated contour measurements...")
+    rows = polymer_msd_table(pooled, 1000, segment)
+    contributors = {str(row["pooled_id"]): row["image_id"] for row in contour_rows if row["pooled_id"] != ""}
+    for row in rows:
+        ids = sorted({contributors[pid] for pid in row["polymer_ids"].split(';')})
+        row["image_count"] = len(ids)
+        row["image_ids"] = ';'.join(map(str, ids))
+    lp = r2 = None
+    progress(96, "Fitting pooled persistence length...")
+    if len(rows) >= 3:
+        lp, r2 = fit_persistence_length_2d(
+            np.array([row["contour_separation_nm"] for row in rows]),
+            np.array([row["mean_square_end_to_end_nm2"] for row in rows]),
+        )
+    contributing = sum(row["accepted_contours"] > 0 for row in image_rows)
+    skipped = sum(row["status"] == "skipped" for row in image_rows)
+    status = f"{len(pooled)} accepted contours from {contributing}/{len(paths)} images; {skipped} images skipped."
+    if lp is None:
+        status += " Not enough contour data for a fit."
+    analysis = PolymerAnalysisResult(params, pooled, rows, lp, r2, status)
+    return PooledPolymerResult(analysis, image_rows, contour_rows)
+
+
+def export_pooled_polymers(result: PooledPolymerResult, plot: Image.Image, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plot.save(output_dir / "pooled_wlc_fit.png")
+    tables = {
+        "images.csv": (result.images, list(dict.fromkeys(key for row in result.images for key in row))),
+        "contours.csv": (result.contours, ["pooled_id", "image_id", "path", "object_id", "length_nm", "end_to_end_nm", "excluded_reason", "endpoint_count", "branchpoint_pixels", "path_valid", "pruned_branches"]),
+        "pooled_msd.csv": (result.analysis.msd_rows, ["contour_separation_nm", "mean_square_end_to_end_nm2",
+            "std_dev_end_to_end_squared_nm2", "sample_count", "polymer_count", "polymer_ids", "image_count", "image_ids"]),
+    }
+    minimum, segment, bias, maximum, branch_prune_nm = result.analysis.params
+    summary = {"min_length_nm": minimum, "max_length_nm": maximum if math.isfinite(maximum) else "",
+               "segment_nm": segment, "threshold_bias": bias, "branch_prune_nm": branch_prune_nm,
+               "persistence_length_nm": result.analysis.persistence_nm, "fit_r2": result.analysis.fit_r2,
+               "status": result.analysis.status_text}
+    tables["summary.csv"] = ([summary], list(summary))
+    for name, (rows, fields) in tables.items():
+        with (output_dir / name).open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
 
 
 def aligned_polymer_contour_points(polymer: PolymerObject, pixels_per_um: float, segment_nm: float) -> np.ndarray:
@@ -1088,7 +1446,9 @@ class OrigamiCounterApp:
         self.polymer_objects: list[PolymerObject] = []
         self.polymer_persistence_nm: float | None = None
         self.polymer_fit_r2: float | None = None
-        self.polymer_msd_rows: list[dict[str, float]] = []
+        self.polymer_msd_rows: list[dict[str, float | str]] = []
+        self.polymer_qc: dict = {}
+        self.polymer_qc_overlay_visible = False
         self.polymer_analysis_cache: dict[str, PolymerAnalysisResult] = {}
         self.labels: dict[str, dict[str, str]] = {}
         self.training_labels: dict[str, dict[str, str]] = {}
@@ -1115,6 +1475,8 @@ class OrigamiCounterApp:
         self.size_range_factor = StringVar(value="0.35-3.0")
         self.threshold_bias = StringVar(value="0.00")
         self.polymer_min_length_nm = StringVar(value="80")
+        self.polymer_max_length_nm = StringVar(value="500")
+        self.polymer_branch_prune_nm = StringVar(value="0")
         self.polymer_segment_nm = StringVar(value="20")
         self.polymer_preview_mode = StringVar(value="Overlay")
         self.polymer_overlay_opacity = StringVar(value="0.55")
@@ -1324,9 +1686,18 @@ class OrigamiCounterApp:
         main = Frame(parent)
         main.pack(fill=BOTH, expand=True)
 
-        sidebar = Frame(main, width=330)
-        sidebar.pack(side=LEFT, fill="y", padx=8, pady=8)
-        sidebar.pack_propagate(False)
+        sidebar_container = Frame(main, width=350)
+        sidebar_container.pack(side=LEFT, fill="y", padx=8, pady=8)
+        sidebar_container.pack_propagate(False)
+        sidebar_canvas = Canvas(sidebar_container, highlightthickness=0)
+        sidebar_scroll = Scrollbar(sidebar_container, orient="vertical", command=sidebar_canvas.yview)
+        sidebar_canvas.configure(yscrollcommand=sidebar_scroll.set)
+        sidebar_scroll.pack(side=RIGHT, fill="y")
+        sidebar_canvas.pack(fill=BOTH, expand=True)
+        sidebar = Frame(sidebar_canvas)
+        sidebar_window = sidebar_canvas.create_window(0, 0, window=sidebar, anchor="nw")
+        sidebar.bind("<Configure>", lambda _event: sidebar_canvas.configure(scrollregion=sidebar_canvas.bbox("all")))
+        sidebar_canvas.bind("<Configure>", lambda event: sidebar_canvas.itemconfigure(sidebar_window, width=event.width))
 
         Button(sidebar, text="Open Root", command=self.choose_root).pack(fill="x")
         Button(sidebar, text="Import SPM Folder", command=self.import_spm_folder).pack(fill="x", pady=(4, 0))
@@ -1344,7 +1715,11 @@ class OrigamiCounterApp:
         settings = ttk.LabelFrame(sidebar, text="Contour Analysis")
         settings.pack(fill="x", pady=8)
         self.add_labeled_entry(settings, "Min length nm", self.polymer_min_length_nm)
+        self.add_labeled_entry(settings, "Max length nm", self.polymer_max_length_nm)
+        Label(settings, text="Leave max blank for no upper limit.", anchor="w").pack(fill="x", padx=6)
         self.add_labeled_entry(settings, "Segment nm", self.polymer_segment_nm)
+        self.add_labeled_entry(settings, "Prune branches nm", self.polymer_branch_prune_nm)
+        Label(settings, text="0 = strict; remove side branches up to this length.", wraplength=285).pack(fill="x", padx=6)
         self.add_labeled_entry(settings, "Threshold bias", self.threshold_bias)
         preview_row = Frame(settings)
         preview_row.pack(fill="x", padx=6, pady=3)
@@ -1362,6 +1737,8 @@ class OrigamiCounterApp:
         self.polymer_opacity_entry.bind("<Return>", lambda _event: self.render_polymer_preview())
         self.polymer_opacity_entry.bind("<FocusOut>", lambda _event: self.render_polymer_preview())
         Button(settings, text="Analyze Polymers", command=self.analyze_current_polymers).pack(fill="x", padx=6, pady=(4, 0))
+        Button(settings, text="Run Pooled Analysis", command=self.run_pooled_analysis).pack(fill="x", padx=6, pady=(4, 0))
+        Button(settings, text="Contour QC", command=self.show_contour_qc).pack(fill="x", padx=6, pady=(4, 0))
         self.polymer_progress = ttk.Progressbar(settings, mode="determinate", maximum=100)
         self.polymer_progress.pack(fill="x", padx=6, pady=(4, 0))
         Label(settings, textvariable=self.polymer_progress_text, justify=LEFT, wraplength=285).pack(fill="x", padx=6, pady=(2, 4))
@@ -1451,6 +1828,13 @@ class OrigamiCounterApp:
         figure_c_frame.columnconfigure(0, weight=1)
         self.polymer_figure_c_canvas.create_text(16, 16, text="Run Preview Figure C Plot to view crop/contour pairs here.", anchor="nw")
         self.polymer_figure_c_canvas.bind("<Configure>", lambda _event: self.render_polymer_figure_c_preview())
+        for canvas, redraw, parent, frame in (
+            (self.polymer_canvas, self.render_polymer_preview, image_box, image_frame),
+            (self.polymer_plot_canvas, self.render_polymer_fit_plot, plot_box, plot_frame),
+            (self.polymer_figure_2b_canvas, self.render_polymer_figure_2b_preview, figure_box, figure_frame),
+            (self.polymer_figure_c_canvas, self.render_polymer_figure_c_preview, figure_c_box, figure_c_frame),
+        ):
+            PreviewZoom(canvas, redraw, parent, before=frame)
 
     def add_labeled_entry(self, parent: Frame, label: str, var: StringVar) -> Entry:
         row = Frame(parent)
@@ -1603,6 +1987,12 @@ class OrigamiCounterApp:
         preview_frame.columnconfigure(0, weight=1)
         self.plot_preview_canvas.create_text(16, 16, text="Generate plot previews to view them here.", anchor="nw")
         self.plot_preview_canvas.bind("<Configure>", lambda _event: self.render_plot_preview())
+        self.plot_preview_canvas.bind("<MouseWheel>", lambda event: self.plot_preview_wheel(event))
+        self.plot_preview_canvas.bind("<Button-4>", lambda _event: self.adjust_plot_preview_zoom(1.25))
+        self.plot_preview_canvas.bind("<Button-5>", lambda _event: self.adjust_plot_preview_zoom(0.8))
+        self.plot_preview_canvas.bind("<ButtonPress-1>", lambda event: self.plot_preview_canvas.scan_mark(event.x, event.y))
+        self.plot_preview_canvas.bind("<B1-Motion>", lambda event: self.plot_preview_canvas.scan_dragto(event.x, event.y, gain=1))
+        self.plot_preview_canvas.bind("<Double-Button-1>", lambda _event: self.reset_plot_preview_zoom())
 
         settings_panel = ttk.LabelFrame(plot_inner, text="Plot Settings", width=260)
         settings_panel.pack(side=RIGHT, fill="y", padx=(8, 0))
@@ -2179,14 +2569,25 @@ class OrigamiCounterApp:
             return ScaleInfo(pixels_per_um=1.0, bar_pixels=1.0, bar_um=self.current_bar_um(), detected=False, source="fallback")
         return detect_scale_bar(image, self.current_bar_um())
 
-    def current_polymer_analysis_params(self) -> tuple[float, float, float]:
-        return (
-            float(self.polymer_min_length_nm.get()),
-            float(self.polymer_segment_nm.get()),
-            float(self.threshold_bias.get()),
-        )
+    def current_polymer_analysis_params(self) -> tuple[float, float, float, float, float]:
+        min_length = float(self.polymer_min_length_nm.get())
+        segment = float(self.polymer_segment_nm.get())
+        bias = float(self.threshold_bias.get())
+        max_text = self.polymer_max_length_nm.get().strip()
+        max_length = float(max_text) if max_text else math.inf
+        if not math.isfinite(min_length) or not math.isfinite(segment) or min_length <= 0 or segment <= 0:
+            raise ValueError("Min length and segment length must be positive finite numbers.")
+        if max_text and (not math.isfinite(max_length) or max_length < min_length):
+            raise ValueError("Max length must be at least Min length, or blank for no upper limit.")
+        if not math.isfinite(bias):
+            raise ValueError("Threshold bias must be a finite number.")
+        pruning = float(self.polymer_branch_prune_nm.get())
+        if not math.isfinite(pruning) or pruning < 0:
+            raise ValueError("Prune branches nm must be a finite, nonnegative number (0 = strict).")
+        return min_length, segment, bias, max_length, pruning
 
     def clear_current_polymer_analysis(self) -> None:
+        self.polymer_qc = {}
         self.polymer_objects = []
         self.polymer_persistence_nm = None
         self.polymer_fit_r2 = None
@@ -2214,6 +2615,7 @@ class OrigamiCounterApp:
             persistence_nm=self.polymer_persistence_nm,
             fit_r2=self.polymer_fit_r2,
             status_text=self.polymer_status.get(),
+            qc=dict(self.polymer_qc),
             figure_2b_image=figure_2b_image if figure_2b_image is not None else (existing.figure_2b_image if existing is not None else None),
             figure_c_image=figure_c_image if figure_c_image is not None else (existing.figure_c_image if existing is not None else None),
         )
@@ -2231,6 +2633,7 @@ class OrigamiCounterApp:
             self.polymer_progress_text.set("Cached polymer analysis does not match current settings.")
             return False
         self.polymer_objects = list(result.objects)
+        self.polymer_qc = dict(result.qc)
         self.polymer_msd_rows = [dict(row) for row in result.msd_rows]
         self.polymer_persistence_nm = result.persistence_nm
         self.polymer_fit_r2 = result.fit_r2
@@ -2414,7 +2817,7 @@ class OrigamiCounterApp:
                 conf = f" {obj.confidence:.2f}" if obj.confidence is not None and not obj.label else ""
                 self.canvas.create_text(x1 + 3, y1 + 3, text=f"{label}{conf}", anchor="nw", fill=color, font=("Segoe UI", 10, "bold"))
         for polymer in self.polymer_objects:
-            if len(polymer.points) < 2:
+            if len(polymer.points) < 2 or not polymer.path_valid:
                 continue
             offset_x, offset_y = self.image_offset
             coords = []
@@ -2495,40 +2898,28 @@ class OrigamiCounterApp:
         self.root.update_idletasks()
 
     def analyze_current_polymers(self) -> None:
-        if self.rgb is None or self.current_image is None:
+        if self.rgb is None or self.current_image is None or getattr(self, "polymer_analysis_running", False):
             return
+        self.polymer_analysis_running = True
         try:
             self.update_polymer_progress(3, "Preparing polymer analysis...")
             scale_info = self.current_scale_info(self.rgb, self.current_image)
-            min_length_nm = float(self.polymer_min_length_nm.get())
-            segment_nm = float(self.polymer_segment_nm.get())
-            if min_length_nm <= 0 or segment_nm <= 0:
-                raise ValueError("Min length and segment length must be positive.")
-            bias = float(self.threshold_bias.get())
+            min_length_nm, segment_nm, bias, max_length_nm, branch_prune_nm = self.current_polymer_analysis_params()
             self.update_polymer_progress(12, "Checking scale and thresholds...")
             self.update_scale_status()
-            self.objects = []
-            self.update_polymer_progress(25, "Detecting and skeletonizing polymer contours...")
-            self.polymer_objects = detect_polymer_contours(self.rgb, scale_info.pixels_per_um, min_length_nm, bias)
-            accepted = [obj for obj in self.polymer_objects if not obj.excluded_reason]
-            self.update_polymer_progress(65, "Calculating mean-square end-to-end distances...")
-            self.polymer_msd_rows = polymer_msd_table(accepted, scale_info.pixels_per_um, segment_nm)
-            if self.polymer_msd_rows:
-                self.update_polymer_progress(78, "Fitting 2D WLC persistence length...")
-                x = np.asarray([row["contour_separation_nm"] for row in self.polymer_msd_rows], dtype=np.float64)
-                y = np.asarray([row["mean_square_end_to_end_nm2"] for row in self.polymer_msd_rows], dtype=np.float64)
-                self.polymer_persistence_nm, self.polymer_fit_r2 = fit_persistence_length_2d(x, y)
-                fit_text = f"Lp {self.polymer_persistence_nm:.1f} nm, R^2 {self.polymer_fit_r2:.3f}"
-            else:
-                self.polymer_persistence_nm = None
-                self.polymer_fit_r2 = None
-                fit_text = "not enough contour data for fit"
-            excluded = len(self.polymer_objects) - len(accepted)
-            mean_length = float(np.mean([obj.length_nm for obj in accepted])) if accepted else 0.0
-            self.polymer_status.set(
-                f"Accepted {len(accepted)} contours; excluded {excluded}.\n"
-                f"Mean length {mean_length:.1f} nm; {fit_text}."
+            result = self.wait_for_polymer_analysis(
+                self.rgb.copy(), scale_info.pixels_per_um, min_length_nm, segment_nm, bias,
+                max_length_nm, branch_prune_nm,
             )
+            self.objects = []
+            self.polymer_objects = result.objects
+            self.polymer_qc = dict(result.qc)
+            self.polymer_msd_rows = result.msd_rows
+            self.polymer_persistence_nm = result.persistence_nm
+            self.polymer_fit_r2 = result.fit_r2
+            accepted = [obj for obj in self.polymer_objects if not obj.excluded_reason]
+            excluded = len(self.polymer_objects) - len(accepted)
+            self.polymer_status.set(result.status_text)
             self.status.set(f"Analyzed polymer contours in {self.current_image.name} using {scale_info.pixels_per_um:.1f} px/um.")
             self.counts_text.set(f"Polymer contours: {len(accepted)} accepted, {excluded} excluded")
             self.cache_current_polymer_analysis()
@@ -2539,6 +2930,255 @@ class OrigamiCounterApp:
         except Exception as exc:
             self.update_polymer_progress(0, "Polymer analysis failed.")
             messagebox.showerror("Polymer analysis failed", f"{exc}\n\n{traceback.format_exc()}")
+        finally:
+            self.polymer_analysis_running = False
+
+    def wait_for_polymer_analysis(
+        self, rgb: np.ndarray, pixels_per_um: float, min_length_nm: float, segment_nm: float, bias: float,
+        max_length_nm: float = math.inf,
+        branch_prune_nm: float = 0.0,
+    ) -> PolymerAnalysisResult:
+        return OrigamiCounterApp.run_polymer_worker(
+            self, lambda progress: analyze_polymer_image(
+                rgb, pixels_per_um, min_length_nm, segment_nm, bias, progress, max_length_nm=max_length_nm, branch_prune_nm=branch_prune_nm,
+            ), "Analyzing Polymers",
+        )
+
+    def run_polymer_worker(self, task: Callable, title: str):
+        """Keep Tk's event loop alive while a worker calculates the contours and fit."""
+        window = Toplevel(self.root)
+        window.title(title)
+        window.transient(self.root)
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", lambda: None)
+        Label(window, text=title, font=("Segoe UI", 12, "bold")).pack(padx=24, pady=(20, 8))
+        Label(window, textvariable=self.polymer_progress_text, wraplength=360).pack(padx=24, pady=8)
+        activity = ttk.Progressbar(window, mode="indeterminate", length=360)
+        activity.pack(padx=24, pady=(8, 24))
+        # A modal grab prevents image/settings changes, but wait_window still runs
+        # Tk events so the loading animation and stage messages keep updating.
+        window.grab_set()
+        activity.start(30)
+        messages = queue.Queue()
+        outcome = {}
+
+        def worker() -> None:
+            try:
+                result = task(lambda value, text: messages.put(("progress", (value, text))))
+                messages.put(("result", result))
+            except Exception:
+                messages.put(("error", traceback.format_exc()))
+
+        def poll() -> None:
+            try:
+                while True:
+                    kind, payload = messages.get_nowait()
+                    if kind == "progress":
+                        self.update_polymer_progress(*payload)
+                    else:
+                        outcome[kind] = payload
+                        activity.stop()
+                        window.destroy()
+                        return
+            except queue.Empty:
+                window.after(50, poll)
+
+        try:
+            threading.Thread(target=worker, name="polymer-analysis", daemon=True).start()
+            window.after(50, poll)
+            self.root.wait_window(window)
+        finally:
+            if window.winfo_exists():
+                activity.stop()
+                window.destroy()
+        if "error" in outcome:
+            raise RuntimeError(outcome["error"])
+        if "result" not in outcome:
+            raise RuntimeError("Polymer analysis window closed before completion.")
+        return outcome["result"]
+
+    def run_pooled_analysis(self) -> None:
+        if getattr(self, "polymer_analysis_running", False):
+            return
+        if not self.images:
+            messagebox.showinfo("Pooled analysis", "Open a folder containing AFM images first.")
+            return
+        self.polymer_analysis_running = True
+        try:
+            params = self.current_polymer_analysis_params()
+            paths = list(self.images)
+            calibrations = {key: dict(value) for key, value in self.scale_calibrations.items()}
+            self.update_polymer_progress(0, f"Preparing pooled analysis of {len(paths)} images...")
+            result = self.run_polymer_worker(
+                lambda progress: analyze_pooled_polymers(paths, calibrations, params, progress),
+                "Running Pooled Analysis",
+            )
+            self.update_polymer_progress(98, "Rendering pooled fit...")
+            plot = self.polymer_fit_plot_image(result.analysis, pooled=True)
+            self.show_pooled_polymer_results(result, plot)
+            self.update_polymer_progress(100, "Pooled analysis complete.")
+        except Exception as exc:
+            self.update_polymer_progress(0, "Pooled analysis failed.")
+            messagebox.showerror("Pooled analysis failed", str(exc))
+        finally:
+            self.polymer_analysis_running = False
+
+    def show_contour_qc(self) -> None:
+        if self.polymer_qc_overlay_visible:
+            self.polymer_qc_overlay_visible = False
+            self.render_polymer_preview()
+            return
+        if self.current_image is None:
+            return
+        self.ensure_current_polymer_analysis()
+        cached = self.polymer_analysis_cache.get(image_key(self.current_image))
+        try:
+            if cached is None or cached.params != self.current_polymer_analysis_params():
+                return
+        except ValueError:
+            return
+        self.polymer_qc_overlay_visible = True
+        self.polymer_preview_mode.set("Overlay")
+        self.set_polymer_view("analysis")
+
+    def draw_polymer_qc_overlay(self, canvas: Canvas, width: int) -> None:
+        qc = self.polymer_qc
+        if not qc or not self.polymer_qc_overlay_visible:
+            return
+        def count(key):
+            return str(qc.get(key, "—"))
+        text = (
+            f"Accepted {count('accepted_contours')} / {count('candidate_components')} candidates "
+            f"({qc.get('acceptance_percent', 0):.1f}%)\n"
+            f"Rejected: boundary {count('touches_scan_boundary')} · topology {count('branched_or_incomplete_skeleton')}\n"
+            f"Too short {count('shorter_than_min_length')} · too long {count('longer_than_max_length')}\n"
+            f"Small fragments removed: {count('small_components_removed')}\n"
+            f"Pruned branches: {count('pruned_branches')} · rescued contours: {count('rescued_contours')}\n"
+            f"Threshold {qc.get('threshold_0_to_1', 0):.3f} ({qc.get('polarity', '—')}) · "
+            f"foreground {qc.get('foreground_percent', 0):.1f}%\n"
+            f"Analysis resolution: {qc.get('analysis_nm_per_pixel', 0):.2f} nm/pixel\n"
+            "After pruning: 2 endpoints, no branches. Red = rejected.\n"
+            "Acceptance is not detection completeness."
+        )
+        wrap = max(100, min(370, width - 48))
+        title = canvas.create_text(24, 22, text="Contour QC", anchor="nw", fill="white",
+                                   font=("Segoe UI", 12, "bold"), tags="qc_overlay")
+        title_box = canvas.bbox(title)
+        body = canvas.create_text(24, title_box[3] + 6, text=text, anchor="nw", fill="#edf2f7",
+                                  font=("Segoe UI", 10), width=wrap, tags="qc_overlay")
+        body_box = canvas.bbox(body)
+        link = canvas.create_text(24, body_box[3] + 8, text="View per-contour details", anchor="nw",
+                                  fill="#83d5ff", font=("Segoe UI", 10, "underline"), tags=("qc_overlay", "qc_details"))
+        box = canvas.bbox("qc_overlay")
+        background = canvas.create_rectangle(box[0] - 10, box[1] - 8, box[2] + 10, box[3] + 8,
+                                              fill="#18232f", outline="#64748b", tags="qc_overlay")
+        canvas.tag_lower(background, title)
+        canvas.tag_bind(link, "<Button-1>", lambda _event: self.show_polymer_qc_window(
+            self.polymer_qc, self.polymer_objects, self.current_image.name,
+        ))
+
+    def show_polymer_qc_window(self, qc: dict, objects: list[PolymerObject], title: str) -> None:
+        window = Toplevel(self.root)
+        window.title(f"Contour QC — {title}")
+        window.geometry("950x740")
+        Label(window, text=title, font=("Segoe UI", 12, "bold")).pack(padx=12, pady=10)
+        explanation = (
+            "Detection: threshold image → remove small fragments → thin to centerlines → reject boundary, topology, and length failures.\n"
+            "After pruning, accepted paths must have exactly 2 endpoints and 0 branch pixels (8-neighbor connectivity).\n"
+            "Acceptance is a fraction of detected components, not the fraction of real polymers found. Red traces are excluded.\n"
+            "A branch pixel is not a separate physical junction. Invalid paths have no measurable contour length."
+        )
+        Label(window, text=explanation, justify=LEFT, wraplength=920).pack(fill="x", padx=12, pady=6)
+        metrics = ttk.Treeview(window, columns=("metric", "value"), show="headings", height=14)
+        metrics.heading("metric", text="QC metric")
+        metrics.heading("value", text="Value")
+        metrics.column("metric", width=600)
+        metrics.column("value", width=200)
+        metrics.pack(fill="x", padx=12, pady=8)
+        labels = {
+            "pixels_per_um": "Source calibration (pixels/µm)",
+            "analysis_nm_per_pixel": "Analysis resolution (nm/pixel after resizing)",
+            "threshold_0_to_1": "Intensity cutoff (0–1; normalized image brightness, not height)",
+            "polarity": "Selected foreground polarity",
+            "foreground_percent": "Pixels selected before cleanup (%)",
+            "small_components_removed": "Small threshold components removed before tracing",
+            "candidate_components": "Candidate skeleton components after cleanup",
+            "accepted_contours": "Accepted contours",
+            "acceptance_percent": "Accepted / candidate components (%)",
+            "touches_scan_boundary": "Rejected: touches scan boundary",
+            "branched_or_incomplete_skeleton": "Rejected: branched / loop / invalid path",
+            "shorter_than_min_length": "Rejected: below minimum length (valid paths only)",
+            "longer_than_max_length": "Rejected: above maximum length (valid paths only)",
+            "branch_prune_nm": "Maximum side-branch length to prune (nm; 0 = strict)",
+            "pruned_branches": "Short side branches removed",
+            "rescued_contours": "Accepted contours rescued by branch pruning",
+        }
+        for key, label in labels.items():
+            value = qc.get(key, "unavailable")
+            metrics.insert("", END, values=(label, f"{value:.4g}" if isinstance(value, float) else value))
+        Label(window, text="Rejection counts use one reason per component; boundary rejection takes priority.\n"
+              "Use Prune branches nm for short spurs; inspect rescued traces. Increasing Max length cannot fix branching.",
+              justify=LEFT).pack(fill="x", padx=12)
+        frame = Frame(window)
+        frame.pack(fill=BOTH, expand=True, padx=12, pady=10)
+        table = ttk.Treeview(frame, columns=("id", "status", "length", "ends", "branches", "pruned"), show="headings")
+        for key, label, width in (("id", "Contour ID", 80), ("status", "Result", 330), ("length", "Length (nm)", 110),
+                                  ("ends", "Endpoints", 90), ("branches", "Branch pixels", 110), ("pruned", "Pruned", 70)):
+            table.heading(key, text=label)
+            table.column(key, width=width)
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=table.yview)
+        table.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=RIGHT, fill="y")
+        table.pack(fill=BOTH, expand=True)
+        for obj in objects:
+            table.insert("", END, values=(obj.object_id, obj.excluded_reason or "accepted",
+                f"{obj.length_nm:.1f}" if obj.path_valid else "unavailable", obj.endpoint_count, obj.branchpoint_pixels, obj.pruned_branches))
+
+    def show_pooled_polymer_results(self, result: PooledPolymerResult, plot: Image.Image) -> None:
+        window = Toplevel(self.root)
+        window.title("Pooled Polymer Analysis")
+        window.geometry("1000x780")
+        Label(window, text=result.analysis.status_text, wraplength=950).pack(padx=12, pady=(12, 4))
+        Label(window, text="All images in the folder list • Pair-weighted mean • Error bars: ±1 SD").pack(pady=4)
+        # Capture the output location now so switching folders won't redirect export.
+        base_output = self.output_dir / "polymer_persistence"
+
+        def export() -> None:
+            directory = base_output / f"pooled_{datetime.now():%Y%m%d_%H%M%S_%f}"
+            try:
+                export_pooled_polymers(result, plot, directory)
+                messagebox.showinfo("Pooled results exported", f"Saved plot, measurements, settings, and image/contour IDs to:\n{directory}", parent=window)
+            except Exception as exc:
+                messagebox.showerror("Export failed", str(exc), parent=window)
+
+        Button(window, text="Export Pooled Results", command=export).pack(pady=6)
+        details = ttk.Treeview(window, columns=("image", "count", "qc", "status"), show="headings", height=5)
+        for column, title, width in (("image", "Image", 220), ("count", "Accepted", 70),
+                                    ("qc", "Candidates / boundary / topology / short / long", 340), ("status", "Status / skip reason", 300)):
+            details.heading(column, text=title)
+            details.column(column, width=width)
+        scroll = ttk.Scrollbar(window, orient="vertical", command=details.yview)
+        details.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=RIGHT, fill="y")
+        details.pack(fill="x", padx=12, pady=6)
+        for row in result.images:
+            breakdown = " / ".join(str(row.get(key, "—")) for key in ("candidate_components", "touches_scan_boundary",
+                "branched_or_incomplete_skeleton", "shorter_than_min_length", "longer_than_max_length"))
+            details.insert("", END, values=(f"{row['image_id']}: {Path(row['path']).name}", row["accepted_contours"], breakdown, row["reason"] or row["status"]))
+        canvas = Canvas(window, background="white", highlightthickness=0)
+        canvas.pack(fill=BOTH, expand=True, padx=12, pady=12)
+
+        def draw(_event=None) -> None:
+            preview = zoomed_preview(plot, canvas)
+            canvas.photo = ImageTk.PhotoImage(preview)
+            canvas.delete("all")
+            cw, ch = max(100, canvas.winfo_width()), max(100, canvas.winfo_height())
+            x, y = max(0, (cw - preview.width) // 2), max(0, (ch - preview.height) // 2)
+            canvas.create_image(x, y, image=canvas.photo, anchor="nw")
+            canvas.configure(scrollregion=(0, 0, max(cw, preview.width + x), max(ch, preview.height + y)))
+
+        canvas.bind("<Configure>", draw)
+        PreviewZoom(canvas, draw, window, before=canvas)
 
     def annotated_polymer_image(self) -> Image.Image:
         if self.rgb is None:
@@ -2549,11 +3189,13 @@ class OrigamiCounterApp:
             if len(polymer.points) < 2:
                 continue
             color = polymer_color_rgb(polymer)
-            draw.line(polymer.points, fill=color, width=4)
+            draw_polymer_trace(draw, polymer, color, 4)
             if polymer.excluded_reason:
                 continue
             x, y = polymer.points[0]
             draw.text((x + 4, y + 4), str(polymer.object_id), fill=color)
+        if self.polymer_qc_overlay_visible:
+            draw_polymer_failure_labels(draw, self.polymer_objects, image.size, max(11, round(max(image.size) / 65)))
         return image
 
     def current_polymer_overlay_opacity(self) -> float:
@@ -2577,11 +3219,13 @@ class OrigamiCounterApp:
             red, green, blue = polymer_color_rgb(polymer)
             color = (red, green, blue, alpha)
             if not contours_only and alpha > 0:
-                draw.line(polymer.points, fill=(0, 0, 0, int(round(alpha * 0.45))), width=width + 3)
-            draw.line(polymer.points, fill=color, width=width)
+                draw_polymer_trace(draw, polymer, (0, 0, 0, int(round(alpha * 0.45))), width + 3)
+            draw_polymer_trace(draw, polymer, color, width)
             if contours_only and not polymer.excluded_reason:
                 x, y = polymer.points[0]
                 draw.text((x + 4, y + 4), str(polymer.object_id), fill=color)
+        if self.polymer_qc_overlay_visible:
+            draw_polymer_failure_labels(draw, self.polymer_objects, size, max(11, round(max(size) / 65)))
         return layer
 
     def polymer_preview_image(self) -> Image.Image:
@@ -2596,30 +3240,46 @@ class OrigamiCounterApp:
             return Image.alpha_composite(background, self.polymer_contour_layer(base.size, 1.0, contours_only=True)).convert("RGB")
         return Image.alpha_composite(base, self.polymer_contour_layer(base.size, self.current_polymer_overlay_opacity())).convert("RGB")
 
-    def polymer_fit_plot_image(self) -> Image.Image:
+    def polymer_fit_plot_image(self, analysis: PolymerAnalysisResult | None = None, pooled: bool = False) -> Image.Image:
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
+        rows = analysis.msd_rows if analysis is not None else self.polymer_msd_rows
+        persistence = analysis.persistence_nm if analysis is not None else self.polymer_persistence_nm
+        fit_r2 = analysis.fit_r2 if analysis is not None else self.polymer_fit_r2
+
         fig, ax = plt.subplots(figsize=(7.6, 4.4))
-        if not self.polymer_msd_rows or self.polymer_persistence_nm is None:
-            ax.text(0.5, 0.5, "Run Analyze Polymers to generate the WLC fit.", ha="center", va="center", transform=ax.transAxes)
+        if not rows or persistence is None:
+            text = "Not enough accepted contour data for a pooled fit." if pooled else "Run Analyze Polymers to generate the WLC fit."
+            ax.text(0.5, 0.5, text, ha="center", va="center", transform=ax.transAxes)
             ax.set_axis_off()
         else:
-            x = np.asarray([row["contour_separation_nm"] for row in self.polymer_msd_rows], dtype=np.float64)
-            y = np.asarray([row["mean_square_end_to_end_nm2"] for row in self.polymer_msd_rows], dtype=np.float64)
-            counts = np.asarray([row["sample_count"] for row in self.polymer_msd_rows], dtype=np.float64)
+            x = np.asarray([row["contour_separation_nm"] for row in rows], dtype=np.float64)
+            y = np.asarray([row["mean_square_end_to_end_nm2"] for row in rows], dtype=np.float64)
+            counts = np.asarray([row["sample_count"] for row in rows], dtype=np.float64)
+            spread = np.asarray([row["std_dev_end_to_end_squared_nm2"] for row in rows], dtype=np.float64)
+            polymer_counts = np.asarray([row["polymer_count"] for row in rows], dtype=np.float64)
             sizes = 24.0 + 56.0 * counts / max(float(counts.max()), 1.0)
-            ax.scatter(x, y, s=sizes, color="#2ec4b6", edgecolor="#173f3a", linewidth=0.7, label="Measured contour separations")
+            ax.errorbar(x, y, yerr=spread, fmt="none", ecolor="#648d87", alpha=0.65,
+                        capsize=3, linewidth=1, label="±1 SD of squared pair distances")
+            dots = ax.scatter(x, y, s=sizes, c=polymer_counts, cmap="viridis",
+                              edgecolor="#173f3a", linewidth=0.7,
+                              label="Pooled mean (size = pair count)", zorder=3)
+            colorbar = fig.colorbar(dots, ax=ax, pad=0.02)
+            colorbar.set_label("Contributing polymers")
+            from matplotlib.ticker import MaxNLocator
+            colorbar.locator = MaxNLocator(integer=True)
+            colorbar.update_ticks()
             fit_x = np.linspace(float(x.min()), float(x.max()), 240)
-            fit_y = wlc_mean_square_end_to_end_2d(fit_x, self.polymer_persistence_nm)
+            fit_y = wlc_mean_square_end_to_end_2d(fit_x, persistence)
             ax.plot(fit_x, fit_y, color="#ff5a5f", linewidth=2.0, label="2D WLC fit")
             ax.set_xlabel("Contour separation lc (nm)")
-            ax.set_ylabel("<R^2> (nm^2)")
-            title = f"Persistence length Lp = {self.polymer_persistence_nm:.1f} nm"
-            if self.polymer_fit_r2 is not None:
-                title += f"   R^2 = {self.polymer_fit_r2:.4f}"
+            ax.set_ylabel("Mean squared end-to-end distance (nm²)")
+            title = ("Pooled " if pooled else "") + f"Persistence length Lp = {persistence:.1f} nm"
+            if fit_r2 is not None:
+                title += f"   R^2 = {fit_r2:.4f}"
             ax.set_title(title)
             ax.grid(alpha=0.25)
             ax.legend(loc="best")
@@ -2678,9 +3338,16 @@ class OrigamiCounterApp:
     def ensure_current_polymer_analysis(self) -> bool:
         if self.current_image is None or self.rgb is None:
             return False
-        if not self.polymer_objects:
+        try:
+            params = self.current_polymer_analysis_params()
+        except ValueError as exc:
+            messagebox.showerror("Invalid contour settings", str(exc))
+            return False
+        cached = self.polymer_analysis_cache.get(image_key(self.current_image))
+        if not self.polymer_objects or cached is None or cached.params != params:
             self.analyze_current_polymers()
-        return bool(self.polymer_objects)
+        cached = self.polymer_analysis_cache.get(image_key(self.current_image))
+        return bool(self.polymer_objects) and cached is not None and cached.params == params
 
     def render_polymer_preview(self) -> None:
         canvas = getattr(self, "polymer_canvas", None)
@@ -2696,8 +3363,7 @@ class OrigamiCounterApp:
             return
         cw = max(canvas.winfo_width(), 100)
         ch = max(canvas.winfo_height(), 100)
-        display = Image.fromarray(self.rgb).convert("RGB")
-        display.thumbnail((cw, ch), Image.Resampling.LANCZOS)
+        display = zoomed_preview(Image.fromarray(self.rgb).convert("RGB"), canvas)
         mode = self.polymer_preview_mode.get().strip().lower()
         if self.polymer_objects and mode != "original":
             scale_x = display.width / max(self.rgb.shape[1], 1)
@@ -2712,15 +3378,18 @@ class OrigamiCounterApp:
             draw = ImageDraw.Draw(layer)
             alpha = 255 if mode == "contours" else int(round(opacity * 255))
             width = max(2, int(round(max(display.size) / 550)))
+            scaled_polymers = [replace(polymer, points=[(px * scale_x, py * scale_y) for px, py in polymer.points])
+                               for polymer in self.polymer_objects]
             for polymer in self.polymer_objects:
                 if len(polymer.points) < 2:
                     continue
                 points = [(x * scale_x, y * scale_y) for x, y in polymer.points]
                 red, green, blue = polymer_color_rgb(polymer)
                 color = (red, green, blue, alpha)
+                scaled_polymer = replace(polymer, points=points)
                 if mode != "contours" and alpha > 0:
-                    draw.line(points, fill=(0, 0, 0, int(round(alpha * 0.45))), width=width + 3)
-                draw.line(points, fill=color, width=width)
+                    draw_polymer_trace(draw, scaled_polymer, (0, 0, 0, int(round(alpha * 0.45))), width + 3)
+                draw_polymer_trace(draw, scaled_polymer, color, width)
                 if polymer.excluded_reason:
                     continue
                 x0, y0 = points[0]
@@ -2729,11 +3398,15 @@ class OrigamiCounterApp:
                 badge_w = max(16, 8 + 6 * len(label))
                 draw.rectangle((x0 + 4, y0 + 4, x0 + 4 + badge_w, y0 + 22), fill=(255, 255, 255, badge_alpha), outline=(0, 0, 0, badge_alpha))
                 draw.text((x0 + 8, y0 + 6), label, fill=(0, 0, 0, badge_alpha))
+            if self.polymer_qc_overlay_visible:
+                draw_polymer_failure_labels(draw, scaled_polymers, display.size)
             display = Image.alpha_composite(base, layer).convert("RGB")
         self.polymer_preview_photo = ImageTk.PhotoImage(display)
         x = max(0, (cw - display.width) // 2)
         y = max(0, (ch - display.height) // 2)
         canvas.create_image(x, y, image=self.polymer_preview_photo, anchor="nw")
+        if mode == "overlay":
+            self.draw_polymer_qc_overlay(canvas, cw)
         canvas.configure(scrollregion=(0, 0, max(cw, display.width + x), max(ch, display.height + y)))
 
     def render_polymer_fit_plot(self) -> None:
@@ -2748,8 +3421,7 @@ class OrigamiCounterApp:
         image = self.polymer_fit_plot_image()
         cw = max(canvas.winfo_width(), 100)
         ch = max(canvas.winfo_height(), 100)
-        display = image.copy()
-        display.thumbnail((cw, ch), Image.Resampling.LANCZOS)
+        display = zoomed_preview(image, canvas)
         self.polymer_plot_photo = ImageTk.PhotoImage(display)
         x = max(0, (cw - display.width) // 2)
         y = max(0, (ch - display.height) // 2)
@@ -2771,8 +3443,7 @@ class OrigamiCounterApp:
             return
         cw = max(canvas.winfo_width(), 100)
         ch = max(canvas.winfo_height(), 100)
-        display = image.copy()
-        display.thumbnail((cw, ch), Image.Resampling.LANCZOS)
+        display = zoomed_preview(image, canvas)
         self.polymer_figure_2b_photo = ImageTk.PhotoImage(display)
         x = max(0, (cw - display.width) // 2)
         y = max(0, (ch - display.height) // 2)
@@ -2794,8 +3465,7 @@ class OrigamiCounterApp:
             return
         cw = max(canvas.winfo_width(), 100)
         ch = max(canvas.winfo_height(), 100)
-        display = image.copy()
-        display.thumbnail((cw, ch), Image.Resampling.LANCZOS)
+        display = zoomed_preview(image, canvas)
         self.polymer_figure_c_photo = ImageTk.PhotoImage(display)
         x = max(0, (cw - display.width) // 2)
         y = max(0, (ch - display.height) // 2)
@@ -2920,6 +3590,9 @@ class OrigamiCounterApp:
                 "pixels_per_um",
                 "accepted_contours",
                 "excluded_contours",
+                "min_length_nm",
+                "max_length_nm",
+                "branch_prune_nm",
                 "segment_nm",
                 "persistence_length_nm",
                 "fit_r2",
@@ -2933,6 +3606,9 @@ class OrigamiCounterApp:
                     "pixels_per_um": f"{scale_info.pixels_per_um:.6g}",
                     "accepted_contours": len(accepted),
                     "excluded_contours": len(self.polymer_objects) - len(accepted),
+                    "min_length_nm": self.polymer_min_length_nm.get(),
+                    "max_length_nm": self.polymer_max_length_nm.get().strip(),
+                    "branch_prune_nm": self.polymer_branch_prune_nm.get(),
                     "segment_nm": self.polymer_segment_nm.get(),
                     "persistence_length_nm": "" if self.polymer_persistence_nm is None else f"{self.polymer_persistence_nm:.6g}",
                     "fit_r2": "" if self.polymer_fit_r2 is None else f"{self.polymer_fit_r2:.6g}",
@@ -2940,9 +3616,13 @@ class OrigamiCounterApp:
             )
 
         contours_path = output_dir / f"{stem}_polymer_contours.csv"
+        with (output_dir / f"{stem}_polymer_qc.csv").open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["metric", "value"])
+            writer.writerows(self.polymer_qc.items())
         self.update_polymer_progress(25, "Writing contour CSV...")
         with contours_path.open("w", newline="", encoding="utf-8") as f:
-            fieldnames = ["object_id", "accepted", "excluded_reason", "length_nm", "end_to_end_nm", "segment_count", "points_xy"]
+            fieldnames = ["object_id", "accepted", "excluded_reason", "length_nm", "end_to_end_nm", "segment_count", "points_xy", "endpoint_count", "branchpoint_pixels", "path_valid", "pruned_branches"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for obj in self.polymer_objects:
@@ -2951,17 +3631,22 @@ class OrigamiCounterApp:
                         "object_id": obj.object_id,
                         "accepted": "yes" if not obj.excluded_reason else "no",
                         "excluded_reason": obj.excluded_reason,
-                        "length_nm": f"{obj.length_nm:.6g}",
-                        "end_to_end_nm": f"{obj.end_to_end_nm:.6g}",
+                        "length_nm": f"{obj.length_nm:.6g}" if obj.path_valid else "",
+                        "end_to_end_nm": f"{obj.end_to_end_nm:.6g}" if obj.path_valid else "",
                         "segment_count": obj.segment_count,
                         "points_xy": json.dumps([[round(x, 3), round(y, 3)] for x, y in obj.points]),
+                        "endpoint_count": obj.endpoint_count,
+                        "branchpoint_pixels": obj.branchpoint_pixels,
+                        "path_valid": obj.path_valid,
+                        "pruned_branches": obj.pruned_branches,
                     }
                 )
 
         msd_path = output_dir / f"{stem}_polymer_msd.csv"
         self.update_polymer_progress(35, "Writing MSD CSV...")
         with msd_path.open("w", newline="", encoding="utf-8") as f:
-            fieldnames = ["contour_separation_nm", "mean_square_end_to_end_nm2", "sample_count"]
+            fieldnames = ["contour_separation_nm", "mean_square_end_to_end_nm2",
+                          "std_dev_end_to_end_squared_nm2", "sample_count", "polymer_count", "polymer_ids"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(self.polymer_msd_rows)
@@ -5403,11 +6088,14 @@ class OrigamiCounterApp:
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
 
-        photo = ImageTk.PhotoImage(image)
-        canvas.create_image(0, 0, image=photo, anchor="nw")
-        canvas.configure(scrollregion=(0, 0, image.width, image.height))
-        window.analysis_image_photo = photo
-        self.analysis_image_photo = photo
+        def draw(_event=None):
+            preview = zoomed_preview(image, canvas)
+            canvas.photo = ImageTk.PhotoImage(preview)
+            canvas.delete("all")
+            canvas.create_image(0, 0, image=canvas.photo, anchor="nw")
+            canvas.configure(scrollregion=(0, 0, preview.width, preview.height))
+        canvas.bind("<Configure>", draw)
+        PreviewZoom(canvas, draw, window, before=frame)
 
     def refresh_analysis_review_list(self, selected_id: str | None = None) -> None:
         if not hasattr(self, "analysis_review_list"):
@@ -5644,8 +6332,13 @@ class OrigamiCounterApp:
 
     def adjust_plot_preview_zoom(self, factor: float) -> None:
         self.plot_preview_fit_to_window = False
-        self.plot_preview_zoom = max(0.25, min(5.0, self.plot_preview_zoom * factor))
+        self.plot_preview_zoom = max(0.05, min(5.0, self.plot_preview_zoom * factor))
         self.render_plot_preview()
+
+    def plot_preview_wheel(self, event):
+        if event.delta:
+            self.adjust_plot_preview_zoom(1.25 if event.delta > 0 else 0.8)
+        return "break"
 
     def reset_plot_preview_zoom(self) -> None:
         self.plot_preview_fit_to_window = True
@@ -5938,7 +6631,7 @@ class OrigamiCounterApp:
 
 
 def main() -> int:
-    root = Tk()
+    root = create_tk_root()
     app = OrigamiCounterApp(root)
     root.mainloop()
     return 0

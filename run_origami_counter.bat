@@ -41,11 +41,9 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 echo Checking Tkinter support...
-".venv\Scripts\python.exe" -c "import tkinter"
+".venv\Scripts\python.exe" tk_startup.py
 if errorlevel 1 (
-    echo Tkinter is not available in this Python installation.
-    echo Reinstall Python 3 from https://www.python.org/downloads/windows/
-    echo and include the Tcl/Tk and IDLE feature.
+    echo The GUI startup check failed. See the repair instructions above.
     pause
     exit /b 1
 )
